@@ -1,9 +1,7 @@
 package discordgo
 
 import (
-	"encoding/binary"
 	"encoding/json"
-	"fmt"
 	"net"
 	"strings"
 	"sync"
@@ -16,6 +14,7 @@ import (
 const (
 	voiceWSWriteWait      = 10 * time.Second
 	voiceHandshakeTimeout = 10 * time.Second
+	udpKeepAliveInterval  = 5 * time.Second
 )
 
 type VoiceConnection struct {
@@ -23,18 +22,25 @@ type VoiceConnection struct {
 
 	LogLevel int
 
-	UserID   string
-	GuildID  string
-	endpoint string
-	mute     bool
-	deaf     bool
+	// Set by ChannelVoiceJoin before calling v.open()
+
+	UserID    string
+	GuildID   string
+	ChannelID string
+	mute      bool
+	deaf      bool
+	endpoint  string
+	token     string
+	sessionID string
+	session   *Session
 
 	speaking bool
 
 	OpusSend chan []byte
-	OpusRecv chan Packet
+	OpusRecv chan *Packet
 
-	quit chan struct{}
+	quit      chan struct{}
+	waitGroup sync.WaitGroup
 
 	wsConn        *websocket.Conn
 	messageC      chan voiceWSMessage
@@ -53,9 +59,6 @@ type VoiceConnection struct {
 	udpConn *net.UDPConn
 }
 
-type Packet struct {
-}
-
 func (v *VoiceConnection) open() error {
 	endpoint := strings.TrimSuffix(v.endpoint, ":80")
 	gateway := "wss://" + endpoint + "?v=" + voiceAPIVersion
@@ -66,11 +69,13 @@ func (v *VoiceConnection) open() error {
 		return errors.Wrapf(err, "failed to connect to voice gateway %s", gateway)
 	}
 
+	v.LogLevel = LogDebug
 	v.wsConn = wsConn
 	v.heartbeatAckC = make(chan voiceHeartbeatAck)
 	v.helloC = make(chan struct{})
 	v.readyC = make(chan struct{})
 	v.sessionDescC = make(chan struct{})
+	v.waitGroup.Add(1)
 	go v.wsListener()
 
 	timeout := time.After(voiceHandshakeTimeout)
@@ -85,12 +90,14 @@ func (v *VoiceConnection) open() error {
 	ready := v.ready
 	v.RUnlock()
 
+	v.log(LogDebug, "heartbeat interval %v", hello.HeartbeatInterval)
 	// docs specifically say to use 0.75 * heartbeat interval from HELLO
 	// https://discordapp.com/developers/docs/topics/voice-connections#heartbeating
 	heartbeatInterval := time.Duration(0.75*float64(hello.HeartbeatInterval)) * time.Millisecond
 
 	// once this goroutine starts all websocket writes should go through v.messageC via v.emit
 	v.messageC = make(chan voiceWSMessage)
+	v.waitGroup.Add(1)
 	go v.wsEmitter(heartbeatInterval)
 
 	// Open UDP connection
@@ -99,10 +106,11 @@ func (v *VoiceConnection) open() error {
 		return errors.Wrap(err, "failed to open udp connection")
 	}
 	v.udpConn = udpConn
-	go v.udpKeepAlive(5 * time.Second)
+	v.waitGroup.Add(1)
+	go v.udpKeepAlive(udpKeepAliveInterval)
 
 	// Perform IP discovery
-	ip, port, err := v.discoverIP()
+	ip, port, err := ipDiscovery(udpConn, ready.SSRC)
 	if err != nil {
 		return errors.Wrap(err, "failed to perform IP Discovery on udp connection")
 	}
@@ -110,7 +118,14 @@ func (v *VoiceConnection) open() error {
 	// Send Op 1 SELECT PROTOCOL
 	evt := voiceClientEvent{
 		Operation: 1,
-		Data:      voiceSelectProtocol{}, // TODO
+		Data: voiceSelectProtocol{
+			Protocol: "udp",
+			Data: voiceUDPData{
+				Mode:    "xsalsa20_poly1305",
+				Address: ip,
+				Port:    port,
+			},
+		},
 	}
 	msg, err := json.Marshal(evt)
 	if err != nil {
@@ -122,7 +137,6 @@ func (v *VoiceConnection) open() error {
 	}
 
 	// Gateway should send Op 4 SESSION DESCRIPTION after we sent SELECT PROTOCOL
-	var sessionDesc voiceSessionDescription
 	select {
 	case <-timeout:
 		return errors.New("timeout waiting for SESSION DESCRIPTION event")
@@ -131,8 +145,13 @@ func (v *VoiceConnection) open() error {
 
 	// SESSION DESCRIPTION lets us encrypt and decrypt voice packets
 	v.OpusSend = make(chan []byte, 2)
+	v.waitGroup.Add(1)
+	go v.opusSender(48000, 960)
+
 	if !v.deaf {
-		v.OpusRecv = make(chan Packet)
+		v.OpusRecv = make(chan *Packet)
+		v.waitGroup.Add(1)
+		go v.opusReceiver()
 	}
 
 	return nil
@@ -147,39 +166,50 @@ func (v *VoiceConnection) Close() error {
 	default:
 	}
 	close(v.quit)
+	// wait for
+	// - wsListener (returns on Read error)
+	// - wsEmitter (returns on <-v.quit, closes ws conn which will cause read error in wsListener)
+	// - udpKeepAlive (returns on <-v.quit, closes UDP conn which will cause read/write errors)
+	// - opusSender (returns on <-v.quit or UDP write error)
+	// - opusReceiver (returns on Read error or <-v.quit)
+	v.waitGroup.Wait()
+
 	return nil
 }
 
 func (v *VoiceConnection) wsListener() {
+	defer v.waitGroup.Done()
 	defer v.wsConn.Close()
 	for {
 		// TODO read deadline for heartbeat acks? (also so this does not block forever)
 		_, msg, err := v.wsConn.ReadMessage()
 		if err != nil {
 			if closeErr, ok := err.(*websocket.CloseError); ok {
-				//
-				return
+				// TODO
+				_ = closeErr
 			}
-			//
+			return
 		}
 
-		err = v.onVoiceWSEvent(msg)
+		err = v.onVoiceEvent(msg)
 		if err != nil {
-			//
+			v.log(LogWarning, "error in processing voice event %s", err)
 		}
 	}
 }
 
-func (v *VoiceConnection) onVoiceWSEvent(msg []byte) error {
+func (v *VoiceConnection) onVoiceEvent(msg []byte) error {
 	var evt voiceEvent
 	if err := json.Unmarshal(msg, &evt); err != nil {
 		return errors.Wrap(err, "failed to unmarshal event as json")
 	}
 
+	v.log(LogDebug, "receieved %s", msg)
+
 	switch evt.Operation {
 	case 2: // READY
 		var ready voiceReady
-		if err := json.Unmarshal(msg, &ready); err != nil {
+		if err := json.Unmarshal(evt.RawData, &ready); err != nil {
 			return errors.Wrap(err, "failed to unmarshal ready")
 		}
 		v.Lock()
@@ -192,7 +222,7 @@ func (v *VoiceConnection) onVoiceWSEvent(msg []byte) error {
 		v.Unlock()
 	case 4: // SESSION DESCRIPTION
 		var sessionDesc voiceSessionDescription
-		if err := json.Unmarshal(msg, &sessionDesc); err != nil {
+		if err := json.Unmarshal(evt.RawData, &sessionDesc); err != nil {
 			return errors.Wrap(err, "failed to unmarshal sessionDesc")
 		}
 		v.Lock()
@@ -206,7 +236,7 @@ func (v *VoiceConnection) onVoiceWSEvent(msg []byte) error {
 	case 5: // SPEAKING
 	case 6: // HEARTBEAT ACK
 		var heartbeatAck voiceHeartbeatAck
-		if err := json.Unmarshal(msg, &heartbeatAck); err != nil {
+		if err := json.Unmarshal(evt.RawData, &heartbeatAck); err != nil {
 			return errors.Wrap(err, "failed to unmarshal heartbeat ack")
 		}
 		select {
@@ -216,7 +246,7 @@ func (v *VoiceConnection) onVoiceWSEvent(msg []byte) error {
 		}
 	case 8: // HELLO
 		var hello voiceHello
-		if err := json.Unmarshal(msg, &hello); err != nil {
+		if err := json.Unmarshal(evt.RawData, &hello); err != nil {
 			return errors.Wrap(err, "failed to unmarshal hello")
 		}
 		v.Lock()
@@ -229,7 +259,7 @@ func (v *VoiceConnection) onVoiceWSEvent(msg []byte) error {
 		v.Unlock()
 	case 9: // RESUMED
 	default:
-		// unexpected event
+		v.log(LogInformational, "unknown voice operation %d, %v", evt.Operation, string(evt.RawData))
 	}
 
 	return nil
@@ -241,14 +271,16 @@ type voiceWSMessage struct {
 }
 
 func (v *VoiceConnection) wsEmitter(heartbeatInterval time.Duration) {
+	defer v.waitGroup.Done()
+	defer v.wsConn.Close()
 	heartbeat := time.NewTicker(heartbeatInterval)
 	defer heartbeat.Stop()
-	defer v.wsConn.Close()
 
 	var err error
 	defer func() {
 		if err != nil {
 			// TODO log error (reason why loop stopped)
+			v.log(LogError, "error in wsEmitter %s", err)
 		}
 	}()
 
@@ -276,7 +308,7 @@ func (v *VoiceConnection) wsEmitter(heartbeatInterval time.Duration) {
 		case <-heartbeat.C:
 			if !heartbeatAcked {
 				err = errors.New("failed to receive heartbeat ack in time")
-				// TODO attempt reconnect
+				// TODO attempt reconnect ? teardown ?
 				return
 			}
 
@@ -326,7 +358,12 @@ func (v *VoiceConnection) wsHandshake(timeout <-chan time.Time) error {
 	// Send Op 1 IDENTIFY
 	evt := voiceClientEvent{
 		Operation: 0,
-		Data:      voiceIdentify{}, // TODO
+		Data: voiceIdentify{
+			UserID:    v.UserID,
+			ServerID:  v.GuildID,
+			SessionID: v.sessionID,
+			Token:     v.token,
+		},
 	}
 	msg, err := json.Marshal(evt)
 	if err != nil {
@@ -378,90 +415,6 @@ func (v *VoiceConnection) Speaking(b bool) error {
 	return v.emit(evtJSON)
 }
 
-func udpOpen(endpoint string, port int) (*net.UDPConn, error) {
-	endpoint = strings.TrimSuffix(endpoint, ":80")
-	host := fmt.Sprintf("%s:%d", endpoint, port)
-	addr, err := net.ResolveUDPAddr("udp", host)
-	if err != nil {
-		return nil, errors.Wrapf(err, "failed to resolve udp host %v", host)
-	}
-
-	udpConn, err := net.DialUDP("udp", nil, addr)
-	if err != nil {
-		return nil, errors.Wrapf(err, "failed to connect to udp address %v", addr.String())
-	}
-	return udpConn, nil
-}
-
-func (v *VoiceConnection) udpKeepAlive(interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	defer v.udpConn.Close()
-
-	var err error
-	var sequence uint64
-
-	packet := make([]byte, 8)
-
-	for {
-		select {
-		case <-v.quit:
-			return
-		case <-ticker.C:
-		}
-
-		binary.LittleEndian.PutUint64(packet, sequence)
-		sequence++
-
-		_, err = v.udpConn.Write(packet)
-		if err != nil {
-			return
-		}
-	}
-}
-
-func (v *VoiceConnection) discoverIP() (ip string, port uint16, err error) {
-	v.RLock()
-	SSRC := v.ready.SSRC
-	v.RUnlock()
-
-	addr := v.udpConn.RemoteAddr().String()
-
-	// Create a 70 byte array and put the SSRC code from the Opcode 2 READY event
-	// into it.  Then send that over the UDP connection to Discord.
-	sb := make([]byte, 70)
-	binary.BigEndian.PutUint32(sb, SSRC)
-	_, err = v.udpConn.Write(sb)
-	if err != nil {
-		err = errors.Wrapf(err, "udp write error to %s", addr)
-		return
-	}
-
-	// Create a 70 byte array and listen for the initial handshake response
-	// from Discord.  Once we get it parse the IP and PORT information out
-	// of the response.  This should be our public IP and PORT as Discord
-	// saw us.
-	rb := make([]byte, 70)
-	rlen, _, err := v.udpConn.ReadFromUDP(rb)
-	if err != nil {
-		err = errors.Wrapf(err, "udp read error from %s", addr)
-		return
-	}
-
-	if rlen < 70 {
-		err = errors.New("received udp packet too small")
-		return
-	}
-
-	// Loop over position 4 through 20 to grab the IP address
-	// Should never be beyond position 20.
-	for i := 4; i < 20; i++ {
-		if rb[i] == 0 {
-			break
-		}
-		ip += string(rb[i])
-	}
-	// Grab port from position 68 and 69
-	port = binary.LittleEndian.Uint16(rb[68:70])
-	return
+func (v *VoiceConnection) reconnect() error {
+	return nil
 }
