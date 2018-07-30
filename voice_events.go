@@ -7,12 +7,22 @@ import (
 
 const voiceAPIVersion = "3"
 
-// voiceEvent is the base structure of voice websocket events.
+// voiceEvent is the base structure of voice websocket events received from server.
+// The type of the data component of the voiceEvent varies by Opcode.
+// We use a json.RawMessage to delay parsing the data until we know the Opcode.
 type voiceEvent struct {
 	Operation int `json:"op"`
 	// Shape of RawData varies by Operation
 	// May be a nested struct, an int, or null
 	RawData json.RawMessage `json:"d"`
+}
+
+// voiceClientEvent is the base structure of voice websocket events sent by us.
+// As a client we generally know up front what Operation we are sending, so we use a separate
+// base struct to avoid having to do partial json.Marshals on the nested structs.
+type voiceClientEvent struct {
+	Operation int         `json:"op"`
+	Data      interface{} `json:"d"`
 }
 
 // voiceIdentify stores the data of the Opcode 0 IDENTIFY event.
@@ -61,12 +71,20 @@ type voiceSessionDescription struct {
 	SecretKey [32]byte `json:"secret_key"`
 }
 
-// VoiceSpeakingUpdate stores the data of the Opcode 5 SPEAKING event.
+// VoiceSpeakingUpdate stores the data of the server's Opcode 5 SPEAKING event.
 // The SPEAKING event is sent by the server whenever a user in the voice channel starts or stops speaking.
 type VoiceSpeakingUpdate struct {
 	UserID   string `json:"user_id"`
 	SSRC     int    `json:"ssrc"`
 	Speaking bool   `json:"speaking"`
+}
+
+// VoiceSpeaking stores the data of the client's Opcode 5 SPEAKING event.
+// Clients must send a SPEAKING event before sending voice data.
+type voiceSpeaking struct {
+	Speaking bool   `json:"speaking"`
+	Delay    int    `json:"delay"`
+	SSRC     uint32 `json:"ssrc"`
 }
 
 // voiceHeartbeatAck stores the data of the Opcode 6 HEARTBEAT ACK event.
