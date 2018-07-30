@@ -22,7 +22,7 @@ type VoiceConnection struct {
 
 	LogLevel int
 
-	// Set by ChannelVoiceJoin before calling v.open()
+	// Fields in next block should all be set set by ChannelVoiceJoin before calling v.open()
 
 	UserID    string
 	GuildID   string
@@ -34,10 +34,14 @@ type VoiceConnection struct {
 	sessionID string
 	session   *Session
 
-	speaking bool
+	ShouldReconnectOnError bool
 
 	OpusSend chan []byte
 	OpusRecv chan *Packet
+
+	Ready bool
+
+	speaking bool
 
 	quit      chan struct{}
 	waitGroup sync.WaitGroup
@@ -46,15 +50,15 @@ type VoiceConnection struct {
 	messageC      chan voiceWSMessage
 	heartbeatAckC chan voiceHeartbeatAck
 
-	// need to take data from these events to complete voice handshake
+	// take data from these events to complete voice handshake
 	// wsListener goroutine will continue setting them if the events are repeated
 	hello       voiceHello
 	ready       voiceReady
 	sessionDesc voiceSessionDescription
-	// each of these are closed once we have gotten the event at least once
-	helloC       chan struct{}
-	readyC       chan struct{}
-	sessionDescC chan struct{}
+	// each of these are closed the first time we get the corresponding event
+	receivedHello       chan struct{}
+	receivedReady       chan struct{}
+	receivedSessionDesc chan struct{}
 
 	udpConn *net.UDPConn
 }
@@ -70,11 +74,14 @@ func (v *VoiceConnection) open() error {
 	}
 
 	v.LogLevel = LogDebug
+
 	v.wsConn = wsConn
 	v.heartbeatAckC = make(chan voiceHeartbeatAck)
-	v.helloC = make(chan struct{})
-	v.readyC = make(chan struct{})
-	v.sessionDescC = make(chan struct{})
+	v.receivedHello = make(chan struct{})
+	v.receivedReady = make(chan struct{})
+	v.receivedSessionDesc = make(chan struct{})
+	v.quit = make(chan struct{})
+	v.waitGroup = sync.WaitGroup{} // reset the waitgroup just to be safe
 	v.waitGroup.Add(1)
 	go v.wsListener()
 
@@ -140,7 +147,7 @@ func (v *VoiceConnection) open() error {
 	select {
 	case <-timeout:
 		return errors.New("timeout waiting for SESSION DESCRIPTION event")
-	case <-v.sessionDescC:
+	case <-v.receivedSessionDesc:
 	}
 
 	// SESSION DESCRIPTION lets us encrypt and decrypt voice packets
@@ -159,6 +166,7 @@ func (v *VoiceConnection) open() error {
 
 func (v *VoiceConnection) Close() error {
 	v.Lock()
+	v.Ready = false
 	defer v.Unlock()
 	select {
 	case <-v.quit:
@@ -173,7 +181,6 @@ func (v *VoiceConnection) Close() error {
 	// - opusSender (returns on <-v.quit or UDP write error)
 	// - opusReceiver (returns on Read error or <-v.quit)
 	v.waitGroup.Wait()
-
 	return nil
 }
 
@@ -215,9 +222,9 @@ func (v *VoiceConnection) onVoiceEvent(msg []byte) error {
 		v.Lock()
 		v.ready = ready
 		select {
-		case <-v.readyC:
+		case <-v.receivedReady:
 		default:
-			close(v.readyC)
+			close(v.receivedReady)
 		}
 		v.Unlock()
 	case 4: // SESSION DESCRIPTION
@@ -228,9 +235,9 @@ func (v *VoiceConnection) onVoiceEvent(msg []byte) error {
 		v.Lock()
 		v.sessionDesc = sessionDesc
 		select {
-		case <-v.sessionDescC:
+		case <-v.receivedSessionDesc:
 		default:
-			close(v.sessionDescC)
+			close(v.receivedSessionDesc)
 		}
 		v.Unlock()
 	case 5: // SPEAKING
@@ -252,9 +259,9 @@ func (v *VoiceConnection) onVoiceEvent(msg []byte) error {
 		v.Lock()
 		v.hello = hello
 		select {
-		case <-v.helloC:
+		case <-v.receivedHello:
 		default:
-			close(v.helloC)
+			close(v.receivedHello)
 		}
 		v.Unlock()
 	case 9: // RESUMED
@@ -380,12 +387,12 @@ func (v *VoiceConnection) wsHandshake(timeout <-chan time.Time) error {
 	select {
 	case <-timeout:
 		return errors.New("timeout waiting for HELLO event")
-	case <-v.helloC:
+	case <-v.receivedHello:
 	}
 	select {
 	case <-timeout:
 		return errors.New("timeout waiting for READY event")
-	case <-v.readyC:
+	case <-v.receivedReady:
 	}
 
 	return nil
