@@ -69,6 +69,8 @@ func ipDiscovery(udpConn *net.UDPConn, SSRC uint32) (ip string, port uint16, err
 }
 
 func (v *VoiceConnection) udpKeepAlive(interval time.Duration) {
+	v.log(LogDebug, "called")
+
 	defer v.waitGroup.Done()
 	defer v.udpConn.Close()
 	ticker := time.NewTicker(interval)
@@ -97,7 +99,9 @@ func (v *VoiceConnection) udpKeepAlive(interval time.Duration) {
 	}
 }
 
-func (v *VoiceConnection) opusSender(rate, size int) {
+func (v *VoiceConnection) opusSender(src <-chan []byte, rate, size int) {
+	v.log(LogDebug, "called")
+
 	defer v.waitGroup.Done()
 
 	var sequence uint16
@@ -107,9 +111,9 @@ func (v *VoiceConnection) opusSender(rate, size int) {
 	udpHeader := make([]byte, 12)
 	var nonce [24]byte
 
-	v.RLock()
+	v.eventMu.RLock()
 	SSRC := v.ready.SSRC
-	v.RUnlock()
+	v.eventMu.RUnlock()
 
 	// build the parts that don't change in the udpHeader
 	udpHeader[0] = 0x80
@@ -123,15 +127,15 @@ func (v *VoiceConnection) opusSender(rate, size int) {
 		select {
 		case <-v.quit:
 			return
-		case recvbuf, ok = <-v.OpusSend:
+		case recvbuf, ok = <-src:
 			if !ok {
 				return
 			}
 
-			v.RLock()
+			v.eventMu.RLock()
 			speaking := v.speaking
 			secretKey := v.sessionDesc.SecretKey
-			v.RUnlock()
+			v.eventMu.RUnlock()
 
 			if !speaking {
 				err := v.Speaking(true)
@@ -187,7 +191,9 @@ type Packet struct {
 	PCM       []int16
 }
 
-func (v *VoiceConnection) opusReceiver() {
+func (v *VoiceConnection) opusReceiver(dst chan<- *Packet) {
+	v.log(LogDebug, "called")
+
 	defer v.waitGroup.Done()
 
 	recvbuf := make([]byte, 1024)
@@ -221,9 +227,9 @@ func (v *VoiceConnection) opusReceiver() {
 		// decrypt opus data
 		copy(nonce[:], recvbuf[0:12])
 
-		v.RLock()
+		v.eventMu.RLock()
 		secretKey := v.sessionDesc.SecretKey
-		v.RUnlock()
+		v.eventMu.RUnlock()
 
 		p.Opus, _ = secretbox.Open(nil, recvbuf[12:rlen], &nonce, &secretKey)
 
@@ -235,7 +241,7 @@ func (v *VoiceConnection) opusReceiver() {
 		select {
 		case <-v.quit:
 			return
-		case v.OpusRecv <- &p:
+		case dst <- &p:
 		}
 	}
 }
