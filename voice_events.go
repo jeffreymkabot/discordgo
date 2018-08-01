@@ -79,6 +79,10 @@ type VoiceSpeakingUpdate struct {
 	Speaking bool   `json:"speaking"`
 }
 
+// VoiceSpeakingUpdateHandler type provides a function definition for the
+// VoiceSpeakingUpdate event
+type VoiceSpeakingUpdateHandler func(vc *VoiceConnection, vs *VoiceSpeakingUpdate)
+
 // VoiceSpeaking stores the data of the client's Opcode 5 SPEAKING event.
 // Clients must send a SPEAKING event before sending voice data.
 type voiceSpeaking struct {

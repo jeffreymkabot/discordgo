@@ -584,7 +584,27 @@ func (s *Session) ChannelVoiceJoin(gID, cID string, mute, deaf bool) (voice *Voi
 
 	s.log(LogInformational, "called")
 
-	// Add two handlers to receive the next VoiceStateUpdates and VoiceServerUpdates
+	s.RLock()
+	voice, exists := s.VoiceConnections[gID]
+	s.RUnlock()
+	if exists {
+		voice.Close()
+		// should only need VoiceStateUpdate
+	} else {
+		voice = &VoiceConnection{
+			UserID:  s.State.User.ID,
+			GuildID: gID,
+			mute:    mute,
+			deaf:    deaf,
+			session: s,
+		}
+	}
+	// TODO add event handlers for voice state and voice server updates in this guild
+	// await enough information
+	// brand new voice connections need VoiceStateUpdate and VoiceServerUpdate
+	// changing channel should just need VoiceStateUpdate
+
+	// Add two handlers to receive the next VoiceStateUpdate and VoiceServerUpdate
 	// about our user in this guild
 	stateC := make(chan *VoiceStateUpdate, 1)
 	serverC := make(chan *VoiceServerUpdate, 1)
@@ -634,14 +654,14 @@ func (s *Session) ChannelVoiceJoin(gID, cID string, mute, deaf bool) (voice *Voi
 	case state = <-stateC:
 	case <-timeout:
 		err = errors.New("timeout waiting for Voice State Update event")
-		s.log(LogError, err.Error(), err)
+		s.log(LogError, err.Error())
 		return
 	}
 	select {
 	case server = <-serverC:
 	case <-timeout:
 		err = errors.New("timeout waiting for Voice Server Update event")
-		s.log(LogError, err.Error(), err)
+		s.log(LogError, err.Error())
 		return
 	}
 

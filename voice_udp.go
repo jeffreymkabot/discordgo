@@ -51,7 +51,7 @@ func ipDiscovery(udpConn *net.UDPConn, SSRC uint32) (ip string, port uint16, err
 	}
 
 	if rlen < 70 {
-		err = errors.New("received udp packet too small")
+		err = fmt.Errorf("received udp packet too small, %s", rb)
 		return
 	}
 
@@ -68,6 +68,8 @@ func ipDiscovery(udpConn *net.UDPConn, SSRC uint32) (ip string, port uint16, err
 	return
 }
 
+// TODO only send "keep-alive" packets when opusSender is idle
+// TODO test to see if this actually contends with opusSender
 func (v *VoiceConnection) udpKeepAlive(interval time.Duration) {
 	v.log(LogDebug, "called")
 
@@ -93,7 +95,7 @@ func (v *VoiceConnection) udpKeepAlive(interval time.Duration) {
 
 		_, err = v.udpConn.Write(packet)
 		if err != nil {
-			// TODO log error
+			v.log(LogError, "error sending udp keepalive packet, %v", err)
 			return
 		}
 	}
@@ -103,6 +105,12 @@ func (v *VoiceConnection) opusSender(src <-chan []byte, rate, size int) {
 	v.log(LogDebug, "called")
 
 	defer v.waitGroup.Done()
+
+	defer func() {
+		v.eventMu.Lock()
+		v.speaking = false
+		v.eventMu.Unlock()
+	}()
 
 	var sequence uint16
 	var timestamp uint32
@@ -140,7 +148,8 @@ func (v *VoiceConnection) opusSender(src <-chan []byte, rate, size int) {
 			if !speaking {
 				err := v.Speaking(true)
 				if err != nil {
-					// TODO try to send data anyway?
+					// docs say this will disconnect us with an invalid SSRC error, but we can try
+					v.log(LogWarning, "error sending speaking payload before sending voice data, %s", err)
 				}
 			}
 
@@ -162,7 +171,8 @@ func (v *VoiceConnection) opusSender(src <-chan []byte, rate, size int) {
 
 			_, err := v.udpConn.Write(sendbuf)
 			if err != nil {
-				// TODO log
+				v.log(LogError, "udp write error, %s", err)
+				v.log(LogDebug, "voice struct: %#v\n", v)
 				return
 			}
 
@@ -202,15 +212,19 @@ func (v *VoiceConnection) opusReceiver(dst chan<- *Packet) {
 	for {
 		rlen, err := v.udpConn.Read(recvbuf)
 		if err != nil {
-			// TODO log error
+			select {
+			case <-v.quit:
+				// v.Close() was called so error was expected
+				return
+			default:
+			}
+			v.log(LogError, "failed to read from udp connection, %v", err)
 			return
 		}
-
 		select {
 		case <-v.quit:
 			return
 		default:
-			// continue loop
 		}
 
 		// For now, skip anything except audio.

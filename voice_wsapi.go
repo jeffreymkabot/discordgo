@@ -41,11 +41,13 @@ type VoiceConnection struct {
 
 	Ready bool
 
+	voiceSpeakingUpdateHandlers []VoiceSpeakingUpdateHandler
+
 	quit      chan struct{}
 	waitGroup sync.WaitGroup
 
+	wsMutex       sync.Mutex
 	wsConn        *websocket.Conn
-	messageC      chan voiceWSMessage
 	heartbeatAckC chan voiceHeartbeatAck
 
 	// eventMu synchronizes values that may change asynchronously on received (or emitted) events
@@ -67,11 +69,9 @@ type VoiceConnection struct {
 func (v *VoiceConnection) open() (err error) {
 	v.log(LogDebug, "called")
 
-	v.LogLevel = LogDebug
-	v.quit = make(chan struct{})
-	v.waitGroup = sync.WaitGroup{} // reset the waitgroup just to be safe wrt reconnects
-
+	v.Lock()
 	defer func() {
+		v.Unlock()
 		if err != nil {
 			v.log(LogError, err.Error())
 			// close any opened connections or goroutines
@@ -79,10 +79,12 @@ func (v *VoiceConnection) open() (err error) {
 		}
 	}()
 
+	v.LogLevel = LogDebug
+	v.quit = make(chan struct{})
+
 	endpoint := strings.TrimSuffix(v.endpoint, ":80")
 	gateway := "wss://" + endpoint + "?v=" + voiceAPIVersion
 
-	// Open websocket
 	wsConn, _, err := websocket.DefaultDialer.Dial(gateway, nil)
 	if err != nil {
 		err = errors.Wrapf(err, "failed to connect to voice gateway %s", gateway)
@@ -98,9 +100,26 @@ func (v *VoiceConnection) open() (err error) {
 	v.waitGroup.Add(1)
 	go v.wsListener()
 
-	timeout := time.After(voiceHandshakeTimeout)
+	timeoutC := make(chan struct{})
+	time.AfterFunc(voiceHandshakeTimeout, func() {
+		close(timeoutC)
+	})
 
-	err = v.doWSHandshake(timeout)
+	err = v.identify()
+	if err != nil {
+		return
+	}
+	// First two events on gateway after sending IDENITFY should be Op 8 HELLO and Op 2 READY
+	select {
+	case <-timeoutC:
+		err = errors.New("timeout waiting for HELLO event")
+	case <-v.receivedHello:
+	}
+	select {
+	case <-timeoutC:
+		err = errors.New("timeout waiting for READY event")
+	case <-v.receivedReady:
+	}
 	if err != nil {
 		return
 	}
@@ -113,64 +132,39 @@ func (v *VoiceConnection) open() (err error) {
 	// docs specifically say to use 0.75 * heartbeat interval from HELLO
 	// https://discordapp.com/developers/docs/topics/voice-connections#heartbeating
 	heartbeatInterval := time.Duration(0.75*float64(hello.HeartbeatInterval)) * time.Millisecond
-
-	// once this goroutine starts all websocket writes should go through v.messageC via v.emit
-	v.messageC = make(chan voiceWSMessage)
 	v.waitGroup.Add(1)
-	go v.wsEmitter(heartbeatInterval)
+	go v.heartbeat(heartbeatInterval)
 
-	// Open UDP connection
 	udpConn, err := udpOpen(v.endpoint, ready.Port)
 	if err != nil {
 		err = errors.Wrap(err, "failed to open udp connection")
 		return
 	}
 	v.udpConn = udpConn
-	v.waitGroup.Add(1)
-	go v.udpKeepAlive(udpKeepAliveInterval)
 
-	// Perform IP discovery
 	ip, port, err := ipDiscovery(udpConn, ready.SSRC)
 	if err != nil {
 		err = errors.Wrap(err, "failed to perform IP Discovery on udp connection")
 		return
 	}
 
-	// Send Op 1 SELECT PROTOCOL
-	evt := voiceClientEvent{
-		Operation: 1,
-		Data: voiceSelectProtocol{
-			Protocol: "udp",
-			Data: voiceUDPData{
-				Mode:    "xsalsa20_poly1305",
-				Address: ip,
-				Port:    port,
-			},
-		},
-	}
-	msg, err := json.Marshal(evt)
-	if err != nil {
-		err = errors.Wrap(err, "failed to marshal SELECT PROTOCOL message as json")
-		return
-	}
-	err = v.emit(msg)
-	if err != nil {
-		err = errors.Wrap(err, "failed to send SELECT PROTOCOL message")
-		return
-	}
+	v.waitGroup.Add(1)
+	go v.udpKeepAlive(udpKeepAliveInterval)
 
+	err = v.selectProtocol(ip, port)
+	if err != nil {
+		return
+	}
 	// Gateway should send Op 4 SESSION DESCRIPTION after we sent SELECT PROTOCOL
+	// SESSION DESCRIPTION lets us encrypt and decrypt voice packets
 	select {
-	case <-timeout:
+	case <-timeoutC:
 		err = errors.New("timeout waiting for SESSION DESCRIPTION event")
 		return
 	case <-v.receivedSessionDesc:
 	}
 
-	// SESSION DESCRIPTION lets us encrypt and decrypt voice packets
-
-	// don't recreate exported channel if this is a reconnect
-	// client code could be using it
+	// reuse exported channels if this is a reconnect, client code could be using it
 	if v.OpusSend == nil {
 		v.OpusSend = make(chan []byte, 2)
 	}
@@ -178,8 +172,6 @@ func (v *VoiceConnection) open() (err error) {
 	go v.opusSender(v.OpusSend, 48000, 960)
 
 	if !v.deaf {
-		// don't recreate exported channel if this is a reconnect
-		// client code could be using it
 		if v.OpusRecv == nil {
 			v.OpusRecv = make(chan *Packet)
 		}
@@ -194,21 +186,58 @@ func (v *VoiceConnection) Close() error {
 	v.log(LogDebug, "called")
 
 	v.Lock()
-	v.Ready = false
 	defer v.Unlock()
 	select {
 	case <-v.quit:
 		return errors.New("already closed")
 	default:
 	}
+
+	// wsConn and udpConn can be nil if v.open defers v.Close
+	if v.wsConn != nil {
+		v.log(LogInformational, "sending close message on gateway")
+		v.wsMutex.Lock()
+		v.wsConn.SetWriteDeadline(time.Now().Add(voiceWSWriteWait))
+		v.wsConn.WriteMessage(websocket.CloseMessage, []byte{})
+		v.wsMutex.Unlock()
+		v.wsConn.Close()
+	}
+
+	if v.udpConn != nil {
+		v.udpConn.Close()
+	}
+
+	// terminate goroutines
 	close(v.quit)
 	// wait for
-	// - wsListener (returns on Read error)
-	// - wsEmitter (returns on <-v.quit, closes ws conn which will cause read error in wsListener)
+	// - wsListener (returns on Read error after closing websocket above)
+	// - heartbeat (returns on <-v.quit, closes ws conn which will cause read error in wsListener)
 	// - udpKeepAlive (returns on <-v.quit, closes UDP conn which will cause read/write errors)
 	// - opusSender (returns on <-v.quit or UDP write error)
-	// - opusReceiver (returns on Read error or <-v.quit)
+	// - opusReceiver (returns on UDP Read error or <-v.quit)
 	v.waitGroup.Wait()
+	v.Ready = false
+	// TODO what other data should be reset for v.open() during a reconnect
+	v.speaking = false
+	return nil
+}
+
+func (v *VoiceConnection) Disconnect() (err error) {
+	v.log(LogDebug, "called")
+
+	v.Close()
+
+	data := voiceChannelJoinOp{4, voiceChannelJoinData{&v.GuildID, nil, true, true}}
+	v.session.wsMutex.Lock()
+	err = v.session.wsConn.WriteJSON(data)
+	v.session.wsMutex.Unlock()
+
+	v.log(LogInformational, "deleting VoiceConnection %s", v.GuildID)
+
+	v.session.Lock()
+	delete(v.session.VoiceConnections, v.GuildID)
+	v.session.Unlock()
+
 	return nil
 }
 
@@ -221,11 +250,17 @@ func (v *VoiceConnection) wsListener() {
 		// TODO read deadline for heartbeat acks? (also so this does not block forever)
 		_, msg, err := v.wsConn.ReadMessage()
 		if err != nil {
-			if closeErr, ok := err.(*websocket.CloseError); ok {
-				// TODO
-				_ = closeErr
+			select {
+			// v.Close() was called so error was expected
+			case <-v.quit:
+				return
+			default:
 			}
-			v.log(LogError, "error in wsListener %v", err)
+			if closeErr, ok := err.(*websocket.CloseError); ok {
+				v.log(LogError, "voice gateway closed unexpecedly, %s", closeErr)
+				return
+			}
+			v.log(LogError, "failed to read message from voice gateway %v", err)
 			return
 		}
 
@@ -237,7 +272,7 @@ func (v *VoiceConnection) wsListener() {
 }
 
 func (v *VoiceConnection) onVoiceEvent(msg []byte) error {
-	v.log(LogDebug, "receieved %s", msg)
+	v.log(LogDebug, "received: %s", msg)
 
 	var evt voiceEvent
 	if err := json.Unmarshal(msg, &evt); err != nil {
@@ -250,6 +285,7 @@ func (v *VoiceConnection) onVoiceEvent(msg []byte) error {
 		if err := json.Unmarshal(evt.RawData, &ready); err != nil {
 			return errors.Wrap(err, "failed to unmarshal ready")
 		}
+
 		v.eventMu.Lock()
 		v.ready = ready
 		select {
@@ -273,11 +309,29 @@ func (v *VoiceConnection) onVoiceEvent(msg []byte) error {
 		}
 		v.eventMu.Unlock()
 	case 5: // SPEAKING
+		var speakingUpdate VoiceSpeakingUpdate
+		if err := json.Unmarshal(evt.RawData, &speakingUpdate); err != nil {
+			return errors.Wrap(err, "failed to unmarshal speakingUpdate")
+		}
+
+		// We can get a speaking update about ourself if another user changes our channel
+		// If for whatever reason our speaking status gets set to false,
+		// opusSender needs to send a new Speaking frame for users to continue to receive our audio
+		if speakingUpdate.UserID == v.session.State.User.ID {
+			v.eventMu.Lock()
+			v.speaking = speakingUpdate.Speaking
+			v.eventMu.Unlock()
+		}
+
+		for _, h := range v.voiceSpeakingUpdateHandlers {
+			h(v, &speakingUpdate)
+		}
 	case 6: // HEARTBEAT ACK
 		var heartbeatAck voiceHeartbeatAck
 		if err := json.Unmarshal(evt.RawData, &heartbeatAck); err != nil {
 			return errors.Wrap(err, "failed to unmarshal heartbeat ack")
 		}
+
 		select {
 		case <-v.quit:
 		case v.heartbeatAckC <- heartbeatAck:
@@ -288,6 +342,7 @@ func (v *VoiceConnection) onVoiceEvent(msg []byte) error {
 		if err := json.Unmarshal(evt.RawData, &hello); err != nil {
 			return errors.Wrap(err, "failed to unmarshal hello")
 		}
+
 		v.eventMu.Lock()
 		v.hello = hello
 		select {
@@ -304,18 +359,18 @@ func (v *VoiceConnection) onVoiceEvent(msg []byte) error {
 	return nil
 }
 
-type voiceWSMessage struct {
-	message []byte
-	errC    chan error
-}
-
-func (v *VoiceConnection) wsEmitter(heartbeatInterval time.Duration) {
+func (v *VoiceConnection) heartbeat(interval time.Duration) {
 	v.log(LogDebug, "called")
 
 	defer v.waitGroup.Done()
 	defer v.wsConn.Close()
-	heartbeat := time.NewTicker(heartbeatInterval)
+	heartbeat := time.NewTicker(interval)
 	defer heartbeat.Stop()
+
+	// Make sure we get a heartbeat ack before sending the next heartbeat
+	// TODO relate nonces in heartbeat ack and heartbeat to match them up
+	// TODO allow one or more acks to be missed?
+	heartbeatAcked := true
 
 	var err error
 	defer func() {
@@ -325,28 +380,12 @@ func (v *VoiceConnection) wsEmitter(heartbeatInterval time.Duration) {
 		}
 	}()
 
-	// Make sure we get a heartbeat ack before sending the next heartbeat
-	// TODO relate nonces in heartbeat ack and heartbeat to match them up
-	// TODO allow one or more acks to be missed?
-	heartbeatAcked := true
-
 	for {
 		select {
 		case <-v.quit:
-			v.log(LogInformational, "sending close message on gateway")
-			v.wsConn.SetWriteDeadline(time.Now().Add(voiceWSWriteWait))
-			v.wsConn.WriteMessage(websocket.CloseMessage, []byte{})
 			return
-		case msg := <-v.messageC:
-			v.wsConn.SetWriteDeadline(time.Now().Add(voiceWSWriteWait))
-			err = v.wsConn.WriteMessage(websocket.TextMessage, msg.message)
-			// errC should be buffered
-			msg.errC <- err
-			close(msg.errC)
-			if err != nil {
-				return
-			}
-		// handle heartbeats in separate channel so they can "skip the line"
+		case <-v.heartbeatAckC:
+			heartbeatAcked = true
 		case <-heartbeat.C:
 			if !heartbeatAcked {
 				err = errors.New("failed to receive heartbeat ack in time")
@@ -354,6 +393,7 @@ func (v *VoiceConnection) wsEmitter(heartbeatInterval time.Duration) {
 				return
 			}
 
+			v.log(LogDebug, "sending heartbeat")
 			nonce := int(time.Now().Unix())
 			evt := voiceClientEvent{
 				Operation: 3,
@@ -361,74 +401,25 @@ func (v *VoiceConnection) wsEmitter(heartbeatInterval time.Duration) {
 			}
 			msg, err := json.Marshal(evt)
 			if err != nil {
-				err = errors.Wrap(err, "failed to marshal heartbeat as json")
-				// TODO can we just continue here instead of quitting?
+				v.log(LogWarning, "failed to marshal heartbeat as json, %s", err)
+				continue
+			}
+
+			v.wsMutex.Lock()
+			v.wsConn.SetWriteDeadline(time.Now().Add(voiceWSWriteWait))
+			err = v.wsConn.WriteMessage(websocket.TextMessage, msg)
+			v.wsMutex.Unlock()
+			if err != nil {
+				err = errors.Wrapf(err, "failed to send heartbeat to voice gateway %s", v.endpoint)
 				return
 			}
 
-			v.wsConn.SetWriteDeadline(time.Now().Add(voiceWSWriteWait))
-			err = v.wsConn.WriteMessage(websocket.TextMessage, msg)
-			if err != nil {
-				err = errors.Wrap(err, "failed to send heartbeat")
-				return
-			}
 			heartbeatAcked = false
-		case <-v.heartbeatAckC:
-			heartbeatAcked = true
 		}
 	}
 }
 
-func (v *VoiceConnection) emit(message []byte) error {
-	msg := voiceWSMessage{
-		message: message,
-		// buffer errC so the wsEmitter goroutine doesn't block on sending back error
-		errC: make(chan error, 1),
-	}
-	select {
-	case <-v.quit:
-		return errors.New("voice connection closed")
-	// TODO wsEmitter can close a channel on return instead of using this timeout
-	case <-time.After(voiceWSWriteWait):
-		return errors.New("timeout waiting to pass event")
-	case v.messageC <- msg:
-		return <-msg.errC
-	}
-}
-
-func (v *VoiceConnection) doWSHandshake(timeout <-chan time.Time) error {
-	// Send Op 1 IDENTIFY
-	evt := voiceClientEvent{
-		Operation: 0,
-		Data: voiceIdentify{
-			UserID:    v.UserID,
-			ServerID:  v.GuildID,
-			SessionID: v.sessionID,
-			Token:     v.token,
-		},
-	}
-	msg, err := json.Marshal(evt)
-	if err != nil {
-		return errors.Wrap(err, "failed to marshal IDENTIFY message as json")
-	}
-
-	v.wsConn.SetWriteDeadline(time.Now().Add(voiceWSWriteWait))
-	err = v.wsConn.WriteMessage(websocket.TextMessage, msg)
-	if err != nil {
-		return errors.Wrap(err, "failed to send IDENTIFY message")
-	}
-
-	// First two events on gateway after sending IDENITFY should be Op 8 HELLO and Op 2 READY
-	select {
-	case <-timeout:
-		return errors.New("timeout waiting for HELLO event")
-	case <-v.receivedHello:
-	}
-	select {
-	case <-timeout:
-		return errors.New("timeout waiting for READY event")
-	case <-v.receivedReady:
-	}
+func (v *VoiceConnection) reconnect() error {
 	return nil
 }
 
@@ -446,18 +437,76 @@ func (v *VoiceConnection) Speaking(b bool) error {
 			Speaking: b,
 		},
 	}
-	evtJSON, err := json.Marshal(evt)
+	msg, err := json.Marshal(evt)
 	if err != nil {
 		return errors.Wrap(err, "failed to marshal SPEAKING message as json")
+	}
+
+	v.wsMutex.Lock()
+	v.wsConn.SetWriteDeadline(time.Now().Add(voiceWSWriteWait))
+	err = v.wsConn.WriteMessage(websocket.TextMessage, msg)
+	v.wsMutex.Unlock()
+	if err != nil {
+		return errors.Wrap(err, "failed to send SPEAKING message to voice gateway")
 	}
 
 	v.eventMu.Lock()
 	v.speaking = b
 	v.eventMu.Unlock()
-
-	return v.emit(evtJSON)
+	return nil
 }
 
-func (v *VoiceConnection) reconnect() error {
+func (v *VoiceConnection) identify() error {
+	// Send Op 1 IDENTIFY
+	evt := voiceClientEvent{
+		Operation: 0,
+		Data: voiceIdentify{
+			UserID:    v.UserID,
+			ServerID:  v.GuildID,
+			SessionID: v.sessionID,
+			Token:     v.token,
+		},
+	}
+	msg, err := json.Marshal(evt)
+	if err != nil {
+		return errors.Wrap(err, "failed to marshal IDENTIFY message as json")
+	}
+
+	v.wsMutex.Lock()
+	v.wsConn.SetWriteDeadline(time.Now().Add(voiceWSWriteWait))
+	err = v.wsConn.WriteMessage(websocket.TextMessage, msg)
+	v.wsMutex.Unlock()
+	if err != nil {
+		return errors.Wrap(err, "failed to send IDENTIFY message to voice gateway")
+	}
+
+	return nil
+}
+
+func (v *VoiceConnection) selectProtocol(ip string, port uint16) error {
+	evt := voiceClientEvent{
+		Operation: 1,
+		Data: voiceSelectProtocol{
+			Protocol: "udp",
+			Data: voiceUDPData{
+				Mode:    "xsalsa20_poly1305",
+				Address: ip,
+				Port:    port,
+			},
+		},
+	}
+	msg, err := json.Marshal(evt)
+	if err != nil {
+		return errors.Wrap(err, "failed to marshal SELECT PROTOCOL message as json")
+	}
+
+	v.wsMutex.Lock()
+	v.wsConn.SetWriteDeadline(time.Now().Add(voiceWSWriteWait))
+	err = v.wsConn.WriteMessage(websocket.TextMessage, msg)
+	v.wsMutex.Unlock()
+	if err != nil {
+		return errors.Wrap(err, "failed to send SELECT PROTOCOL message to voice gateway")
+	}
+
 	return nil
 }
