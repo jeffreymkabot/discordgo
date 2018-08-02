@@ -12,9 +12,12 @@ import (
 )
 
 const (
-	voiceWSWriteWait      = 10 * time.Second
+	// Timeout for writes on the voice websocket
+	voiceWSWriteWait = 10 * time.Second
+	// Maximum time allowed for the voice connection handshake
 	voiceHandshakeTimeout = 10 * time.Second
-	udpKeepAliveInterval  = 5 * time.Second
+	// How frequently to send a udp "keep alive" packet
+	udpKeepAliveInterval = 5 * time.Second
 )
 
 type VoiceConnection struct {
@@ -58,12 +61,13 @@ type VoiceConnection struct {
 	hello       voiceHello
 	ready       voiceReady
 	sessionDesc voiceSessionDescription
-	//
+	// used to signal during the handshake that voice events have been received
 	receivedEvent map[voiceOp]chan struct{}
 
 	udpConn *net.UDPConn
 }
 
+// TODO open should error if called on a voiceConnection that is already open
 func (v *VoiceConnection) open() (err error) {
 	v.log(LogDebug, "called")
 
@@ -91,12 +95,14 @@ func (v *VoiceConnection) open() (err error) {
 
 	v.wsConn = wsConn
 	// new websocket connection, so reset all event channels
-	v.heartbeatAckC = make(chan voiceHeartbeatAck)
+	v.heartbeatAckC = make(chan voiceHeartbeatAck, 1)
 	v.receivedEvent = make(map[voiceOp]chan struct{})
 	v.waitGroup.Add(1)
 	go v.wsListener()
 
+	// TODO does it make sense to use a context.Context?
 	timeoutC := make(chan struct{})
+	deadline := time.Now().Add(voiceHandshakeTimeout)
 	time.AfterFunc(voiceHandshakeTimeout, func() {
 		close(timeoutC)
 	})
@@ -106,7 +112,7 @@ func (v *VoiceConnection) open() (err error) {
 	haveReady := false
 	if tryResume && haveReady {
 		// First two events on gateway after sending Resume should be Op 8 Hello and Op 9 Resumed
-		err = v.resume()
+		err = v.resume(deadline)
 		if err != nil {
 			return
 		}
@@ -116,7 +122,7 @@ func (v *VoiceConnection) open() (err error) {
 		}
 	} else {
 		// First two events on gateway after sending Identify should be Op 8 Hello and Op 2 Ready
-		err = v.identify()
+		err = v.identify(deadline)
 		if err != nil {
 			return
 		}
@@ -149,7 +155,7 @@ func (v *VoiceConnection) open() (err error) {
 	}
 	v.udpConn = udpConn
 
-	ip, port, err := ipDiscovery(udpConn, ready.SSRC)
+	ip, port, err := ipDiscovery(udpConn, deadline, ready.SSRC)
 	if err != nil {
 		err = errors.Wrap(err, "failed to perform IP Discovery on udp connection")
 		return
@@ -160,7 +166,7 @@ func (v *VoiceConnection) open() (err error) {
 
 	// Gateway should send Op 4 Session Description after we sent Select Protocol
 	// Session Description lets us encrypt and decrypt voice packets
-	err = v.selectProtocol(ip, port)
+	err = v.selectProtocol(deadline, ip, port)
 	if err != nil {
 		return
 	}
@@ -192,6 +198,9 @@ func (v *VoiceConnection) Close() error {
 
 	v.Lock()
 	defer v.Unlock()
+	if v.quit == nil {
+		return errors.New("never opened")
+	}
 	select {
 	case <-v.quit:
 		return errors.New("already closed")
@@ -247,16 +256,17 @@ func (v *VoiceConnection) Disconnect() (err error) {
 }
 
 func (v *VoiceConnection) reconnect() (err error) {
+	// TODO shouldReconnectOnError
 	v.Close()
 	// tryResume := true
+	wait := 1 * time.Second
 	for {
 		select {
-		// TODO separate channel for canceling a reconnect.
+		// TODO separate channel for canceling a reconnects
 		case <-v.quit:
 			err = errors.New("reconnect canceled")
 			return
-			// TODO increasing wait times
-		case <-time.After(1 * time.Second):
+		case <-time.After(wait):
 		}
 
 		err = v.open()
@@ -264,6 +274,10 @@ func (v *VoiceConnection) reconnect() (err error) {
 			return
 		}
 		// tryResume = false
+		wait *= 2
+		if wait > 600*time.Second {
+			wait = 600 * time.Second
+		}
 	}
 }
 
@@ -319,7 +333,7 @@ func (v *VoiceConnection) onVoiceEvent(msg []byte) error {
 		v.eventMu.Lock()
 		v.ready = ready
 		v.eventMu.Unlock()
-	case voiceOpSessionDescription: // SESSION DESCRIPTION
+	case voiceOpSessionDescription:
 		var sessionDesc voiceSessionDescription
 		if err := json.Unmarshal(evt.RawData, &sessionDesc); err != nil {
 			return errors.Wrap(err, "failed to unmarshal sessionDesc")
@@ -354,8 +368,9 @@ func (v *VoiceConnection) onVoiceEvent(msg []byte) error {
 
 		select {
 		case <-v.quit:
+			// heartbeatAckC should be buffered
 		case v.heartbeatAckC <- heartbeatAck:
-			// TODO could use a buffered channel with default to break out
+		default:
 		}
 	case voiceOpHello:
 		var hello voiceHello
@@ -401,8 +416,8 @@ func (v *VoiceConnection) heartbeat(interval time.Duration) {
 	}()
 
 	// Make sure we get a heartbeat ack before sending the next heartbeat
-	// TODO relate nonces in heartbeat ack and heartbeat to match them up
-	// TODO allow one or more acks to be missed?
+	// TODO relate nonces in heartbeat ack and heartbeat to match them up?
+	// TODO allow one or more acks to be missed? looks like session.heartbeat allows 5 missed heartbeats
 	heartbeatAcked := true
 
 	for {
@@ -476,7 +491,7 @@ func (v *VoiceConnection) Speaking(b bool) error {
 	return nil
 }
 
-func (v *VoiceConnection) identify() error {
+func (v *VoiceConnection) identify(deadline time.Time) error {
 	evt := voiceClientEvent{
 		Operation: voiceOpIdentify,
 		Data: voiceIdentify{
@@ -492,7 +507,7 @@ func (v *VoiceConnection) identify() error {
 	}
 
 	v.wsMutex.Lock()
-	v.wsConn.SetWriteDeadline(time.Now().Add(voiceWSWriteWait))
+	v.wsConn.SetWriteDeadline(deadline)
 	err = v.wsConn.WriteMessage(websocket.TextMessage, msg)
 	v.wsMutex.Unlock()
 	if err != nil {
@@ -502,7 +517,7 @@ func (v *VoiceConnection) identify() error {
 	return nil
 }
 
-func (v *VoiceConnection) selectProtocol(ip string, port uint16) error {
+func (v *VoiceConnection) selectProtocol(deadline time.Time, ip string, port uint16) error {
 	evt := voiceClientEvent{
 		Operation: voiceOpSelectProtocol,
 		Data: voiceSelectProtocol{
@@ -520,7 +535,7 @@ func (v *VoiceConnection) selectProtocol(ip string, port uint16) error {
 	}
 
 	v.wsMutex.Lock()
-	v.wsConn.SetWriteDeadline(time.Now().Add(voiceWSWriteWait))
+	v.wsConn.SetWriteDeadline(deadline)
 	err = v.wsConn.WriteMessage(websocket.TextMessage, msg)
 	v.wsMutex.Unlock()
 	if err != nil {
@@ -530,7 +545,7 @@ func (v *VoiceConnection) selectProtocol(ip string, port uint16) error {
 	return nil
 }
 
-func (v *VoiceConnection) resume() error {
+func (v *VoiceConnection) resume(deadline time.Time) error {
 	evt := voiceClientEvent{
 		Operation: voiceOpResume,
 		Data: voiceResume{
@@ -545,7 +560,7 @@ func (v *VoiceConnection) resume() error {
 	}
 
 	v.wsMutex.Lock()
-	v.wsConn.SetWriteDeadline(time.Now().Add(voiceWSWriteWait))
+	v.wsConn.SetWriteDeadline(deadline)
 	err = v.wsConn.WriteMessage(websocket.TextMessage, msg)
 	v.wsMutex.Unlock()
 	if err != nil {

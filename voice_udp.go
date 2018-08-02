@@ -26,7 +26,10 @@ func udpOpen(endpoint string, port int) (*net.UDPConn, error) {
 	return udpConn, nil
 }
 
-func ipDiscovery(udpConn *net.UDPConn, SSRC uint32) (ip string, port uint16, err error) {
+func ipDiscovery(udpConn *net.UDPConn, deadline time.Time, SSRC uint32) (ip string, port uint16, err error) {
+	udpConn.SetDeadline(deadline)
+	defer udpConn.SetDeadline(time.Time{})
+
 	addr := udpConn.RemoteAddr().String()
 
 	// Create a 70 byte array and put the SSRC code from the Opcode 2 READY event
@@ -70,6 +73,7 @@ func ipDiscovery(udpConn *net.UDPConn, SSRC uint32) (ip string, port uint16, err
 
 // TODO only send "keep-alive" packets when opusSender is idle
 // TODO test to see if this actually contends with opusSender
+// TODO set deadlines for v.udpConn.Writes
 func (v *VoiceConnection) udpKeepAlive(interval time.Duration) {
 	v.log(LogDebug, "called")
 

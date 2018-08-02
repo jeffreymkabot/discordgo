@@ -587,10 +587,7 @@ func (s *Session) ChannelVoiceJoin(gID, cID string, mute, deaf bool) (voice *Voi
 	s.RLock()
 	voice, exists := s.VoiceConnections[gID]
 	s.RUnlock()
-	if exists {
-		voice.Close()
-		// should only need VoiceStateUpdate
-	} else {
+	if !exists {
 		voice = &VoiceConnection{
 			UserID:  s.State.User.ID,
 			GuildID: gID,
@@ -599,15 +596,41 @@ func (s *Session) ChannelVoiceJoin(gID, cID string, mute, deaf bool) (voice *Voi
 			session: s,
 		}
 	}
-	// TODO add event handlers for voice state and voice server updates in this guild
-	// await enough information
-	// brand new voice connections need VoiceStateUpdate and VoiceServerUpdate
-	// changing channel should just need VoiceStateUpdate
 
-	// Add two handlers to receive the next VoiceStateUpdate and VoiceServerUpdate
-	// about our user in this guild
-	stateC := make(chan *VoiceStateUpdate, 1)
-	serverC := make(chan *VoiceServerUpdate, 1)
+	// If we are changing voice channel then discord will only emit a VoiceStateUpdate
+	// Won't emit VoiceServerUpdate unless we have never connected or we send a disconnect frame
+	defer func() {
+		if err != nil {
+			// if there is an error joining the channel send a send disconnect frame to reset things
+			// disconnect also removes the voice connection from the map so next ChannelVoiceJoin
+			// will expect both a VoiceStateUpdate and VoiceServerUpdate
+			voice.Disconnect()
+		}
+	}()
+
+	voice.RLock()
+	needServer := voice.endpoint == "" && voice.token == ""
+	voice.RUnlock()
+
+	var serverC chan *VoiceServerUpdate
+	var stateC chan *VoiceStateUpdate
+	if needServer {
+		// get the next VoiceServerUpdate in this guild
+		serverC = make(chan *VoiceServerUpdate, 1)
+		rmServerHandler := s.AddHandler(func(session *Session, st *VoiceServerUpdate) {
+			if st.GuildID != gID {
+				return
+			}
+			select {
+			case serverC <- st:
+			default:
+			}
+		})
+		defer rmServerHandler()
+	}
+
+	// get the next VoiceStateUpdate about ourself in this guild
+	stateC = make(chan *VoiceStateUpdate, 1)
 	rmStateHandler := s.AddHandler(func(session *Session, st *VoiceStateUpdate) {
 		if st.ChannelID == "" {
 			return
@@ -615,7 +638,6 @@ func (s *Session) ChannelVoiceJoin(gID, cID string, mute, deaf bool) (voice *Voi
 		if st.UserID != session.State.User.ID {
 			return
 		}
-		// must be for this guild
 		if st.GuildID != gID {
 			return
 		}
@@ -624,18 +646,7 @@ func (s *Session) ChannelVoiceJoin(gID, cID string, mute, deaf bool) (voice *Voi
 		default:
 		}
 	})
-	rmServerHandler := s.AddHandler(func(session *Session, st *VoiceServerUpdate) {
-		// must be for this guild
-		if st.GuildID != gID {
-			return
-		}
-		select {
-		case serverC <- st:
-		default:
-		}
-	})
 	defer rmStateHandler()
-	defer rmServerHandler()
 
 	// Send the request to Discord that we want to join the voice channel
 	data := voiceChannelJoinOp{4, voiceChannelJoinData{&gID, &cID, mute, deaf}}
@@ -648,40 +659,47 @@ func (s *Session) ChannelVoiceJoin(gID, cID string, mute, deaf bool) (voice *Voi
 
 	var state *VoiceStateUpdate
 	var server *VoiceServerUpdate
-	timeout := time.After(10 * time.Second)
+	timeoutC := make(chan struct{})
+	time.AfterFunc(10*time.Second, func() {
+		close(timeoutC)
+	})
 
+	if needServer {
+		select {
+		case server = <-serverC:
+		case <-timeoutC:
+			err = errors.New("timeout waiting for Voice Server Update event")
+			s.log(LogError, err.Error())
+			return
+		}
+		voice.Lock()
+		voice.endpoint = server.Endpoint
+		voice.token = server.Token
+		voice.Unlock()
+	}
 	select {
 	case state = <-stateC:
-	case <-timeout:
+	case <-timeoutC:
 		err = errors.New("timeout waiting for Voice State Update event")
 		s.log(LogError, err.Error())
 		return
 	}
-	select {
-	case server = <-serverC:
-	case <-timeout:
-		err = errors.New("timeout waiting for Voice Server Update event")
-		s.log(LogError, err.Error())
-		return
-	}
 
-	voice = &VoiceConnection{
-		UserID:    s.State.User.ID,
-		GuildID:   gID,
-		ChannelID: state.ChannelID,
-		mute:      mute,
-		deaf:      deaf,
-		endpoint:  server.Endpoint,
-		token:     server.Token,
-		sessionID: state.SessionID,
-		session:   s,
-	}
+	voice.Lock()
+	voice.ChannelID = state.ChannelID
+	voice.sessionID = state.SessionID
+	voice.Unlock()
 
+	// close the existing connection before opening a new one to avoid leaking goroutines
+	if exists {
+		voice.Close()
+	}
 	err = voice.open()
 	if err != nil {
 		s.log(LogError, "error opening voice connection, %s", err)
 		return
 	}
+
 	s.Lock()
 	s.VoiceConnections[gID] = voice
 	s.Unlock()
@@ -714,7 +732,6 @@ func (s *Session) onVoiceServerUpdate(st *VoiceServerUpdate) {
 	voice.Lock()
 	voice.token = st.Token
 	voice.endpoint = st.Endpoint
-	voice.GuildID = st.GuildID
 	voice.Unlock()
 
 	// Open a connection to the voice server
