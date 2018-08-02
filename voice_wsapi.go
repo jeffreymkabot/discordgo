@@ -101,18 +101,29 @@ func (v *VoiceConnection) open() (err error) {
 		close(timeoutC)
 	})
 
-	// First two events on gateway after sending Identify should be Op 8 Hello and Op 2 Ready
-	err = v.identify()
-	if err != nil {
-		return
-	}
-	err = v.awaitEvent(voiceOpHello, timeoutC)
-	if err != nil {
-		return
-	}
-	err = v.awaitEvent(voiceOpReady, timeoutC)
-	if err != nil {
-		return
+	// TODO
+	tryResume := false
+	haveReady := false
+	if tryResume && haveReady {
+		// First two events on gateway after sending Resume should be Op 8 Hello and Op 9 Resumed
+		err = v.resume()
+		if err != nil {
+			return
+		}
+		err = v.awaitEvent(timeoutC, voiceOpHello, voiceOpResumed)
+		if err != nil {
+			return
+		}
+	} else {
+		// First two events on gateway after sending Identify should be Op 8 Hello and Op 2 Ready
+		err = v.identify()
+		if err != nil {
+			return
+		}
+		err = v.awaitEvent(timeoutC, voiceOpHello, voiceOpReady)
+		if err != nil {
+			return
+		}
 	}
 
 	v.eventMu.RLock()
@@ -123,6 +134,11 @@ func (v *VoiceConnection) open() (err error) {
 	// docs specifically say to use 0.75 * heartbeat interval from HELLO
 	// https://discordapp.com/developers/docs/topics/voice-connections#heartbeating
 	heartbeatInterval := time.Duration(0.75*float64(hello.HeartbeatInterval)) * time.Millisecond
+	// time.NewTicker will panic if interval is non-positive
+	if hello.HeartbeatInterval <= 0 {
+		err = errors.New("received invalid heartbeat interval " + heartbeatInterval.String())
+		return
+	}
 	v.waitGroup.Add(1)
 	go v.heartbeat(heartbeatInterval)
 
@@ -148,7 +164,7 @@ func (v *VoiceConnection) open() (err error) {
 	if err != nil {
 		return
 	}
-	err = v.awaitEvent(voiceOpSessionDescription, timeoutC)
+	err = v.awaitEvent(timeoutC, voiceOpSessionDescription)
 	if err != nil {
 		return
 	}
@@ -230,11 +246,34 @@ func (v *VoiceConnection) Disconnect() (err error) {
 	return nil
 }
 
+func (v *VoiceConnection) reconnect() (err error) {
+	v.Close()
+	// tryResume := true
+	for {
+		select {
+		// TODO separate channel for canceling a reconnect.
+		case <-v.quit:
+			err = errors.New("reconnect canceled")
+			return
+			// TODO increasing wait times
+		case <-time.After(1 * time.Second):
+		}
+
+		err = v.open()
+		if err == nil {
+			return
+		}
+		// tryResume = false
+	}
+}
+
 func (v *VoiceConnection) wsListener() {
 	v.log(LogDebug, "called")
 
-	defer v.waitGroup.Done()
-	defer v.wsConn.Close()
+	defer func() {
+		v.wsConn.Close()
+		v.waitGroup.Done()
+	}()
 	for {
 		// TODO read deadline for heartbeat acks? (also so this does not block forever)
 		_, msg, err := v.wsConn.ReadMessage()
@@ -333,12 +372,13 @@ func (v *VoiceConnection) onVoiceEvent(msg []byte) error {
 	}
 
 	// Broadcast to any goroutines waiting for this event type (e.g. via awaitEvent).
-	// Replace the channel for the next time the event type is received.
+	// Remove the channel so that the next time the event type is received
+	// there will only be a channel to close if new calls to awaitEvent have been made.
 	v.eventMu.Lock()
 	c, ok := v.receivedEvent[evt.Operation]
 	if ok {
 		close(c)
-		c = make(chan struct{})
+		delete(v.receivedEvent, evt.Operation)
 	}
 	v.eventMu.Unlock()
 
@@ -348,23 +388,22 @@ func (v *VoiceConnection) onVoiceEvent(msg []byte) error {
 func (v *VoiceConnection) heartbeat(interval time.Duration) {
 	v.log(LogDebug, "called")
 
-	defer v.waitGroup.Done()
-	defer v.wsConn.Close()
+	var err error
 	heartbeat := time.NewTicker(interval)
-	defer heartbeat.Stop()
+	defer func() {
+		heartbeat.Stop()
+		v.wsConn.Close()
+		if err != nil {
+			v.log(LogError, "error in wsEmitter %s", err)
+			// TODO if err isnt because v.quit is closed (and the wsConn was closed, then reconnect)
+		}
+		v.waitGroup.Done()
+	}()
 
 	// Make sure we get a heartbeat ack before sending the next heartbeat
 	// TODO relate nonces in heartbeat ack and heartbeat to match them up
 	// TODO allow one or more acks to be missed?
 	heartbeatAcked := true
-
-	var err error
-	defer func() {
-		if err != nil {
-			v.log(LogError, "error in wsEmitter %s", err)
-			// TODO failure here should probably teardown everything
-		}
-	}()
 
 	for {
 		select {
@@ -375,7 +414,6 @@ func (v *VoiceConnection) heartbeat(interval time.Duration) {
 		case <-heartbeat.C:
 			if !heartbeatAcked {
 				err = errors.New("failed to receive Heartbeat ACK in time")
-				// TODO attempt reconnect ? teardown ?
 				return
 			}
 
@@ -405,10 +443,6 @@ func (v *VoiceConnection) heartbeat(interval time.Duration) {
 	}
 }
 
-func (v *VoiceConnection) reconnect() error {
-	return nil
-}
-
 func (v *VoiceConnection) Speaking(b bool) error {
 	v.log(LogDebug, "called")
 
@@ -417,7 +451,7 @@ func (v *VoiceConnection) Speaking(b bool) error {
 	v.eventMu.RUnlock()
 
 	evt := voiceClientEvent{
-		Operation: 5,
+		Operation: voiceOpSpeaking,
 		Data: voiceSpeaking{
 			SSRC:     SSRC,
 			Speaking: b,
@@ -443,9 +477,8 @@ func (v *VoiceConnection) Speaking(b bool) error {
 }
 
 func (v *VoiceConnection) identify() error {
-	// Send Op 1 IDENTIFY
 	evt := voiceClientEvent{
-		Operation: 0,
+		Operation: voiceOpIdentify,
 		Data: voiceIdentify{
 			UserID:    v.UserID,
 			ServerID:  v.GuildID,
@@ -471,7 +504,7 @@ func (v *VoiceConnection) identify() error {
 
 func (v *VoiceConnection) selectProtocol(ip string, port uint16) error {
 	evt := voiceClientEvent{
-		Operation: 1,
+		Operation: voiceOpSelectProtocol,
 		Data: voiceSelectProtocol{
 			Protocol: "udp",
 			Data: voiceUDPData{
@@ -497,23 +530,58 @@ func (v *VoiceConnection) selectProtocol(ip string, port uint16) error {
 	return nil
 }
 
+func (v *VoiceConnection) resume() error {
+	evt := voiceClientEvent{
+		Operation: voiceOpResume,
+		Data: voiceResume{
+			ServerID:  v.GuildID,
+			SessionID: v.sessionID,
+			Token:     v.token,
+		},
+	}
+	msg, err := json.Marshal(evt)
+	if err != nil {
+		return errors.Wrap(err, "failed to marshal Resume event as json")
+	}
+
+	v.wsMutex.Lock()
+	v.wsConn.SetWriteDeadline(time.Now().Add(voiceWSWriteWait))
+	err = v.wsConn.WriteMessage(websocket.TextMessage, msg)
+	v.wsMutex.Unlock()
+	if err != nil {
+		return errors.Wrap(err, "failed to send Resume event to voice gateway")
+	}
+
+	return nil
+}
+
 // awaitEvent is similar in behavior to sync.Cond.Wait
-// Wait until we have processed a websocket event with a particular opcode,
+// Wait until we have processed all websocket event with given opcodes (in any order),
 // or until timeout or the connection is closed.
-func (v *VoiceConnection) awaitEvent(op voiceOp, timeoutC <-chan struct{}) error {
+func (v *VoiceConnection) awaitEvent(timeoutC <-chan struct{}, ops ...voiceOp) error {
+	var events []chan struct{}
+
 	v.eventMu.Lock()
-	c, ok := v.receivedEvent[op]
-	if !ok {
-		c = make(chan struct{})
-		v.receivedEvent[op] = c
+	for _, op := range ops {
+		c, ok := v.receivedEvent[op]
+		if !ok {
+			c = make(chan struct{})
+			v.receivedEvent[op] = c
+		}
+		events = append(events, c)
 	}
 	v.eventMu.Unlock()
-	select {
-	case <-v.quit:
-		return errors.New("connection closed")
-	case <-timeoutC:
-		return errors.New("timeout waiting for " + op.String() + " event")
-	case <-c:
+
+	// wait for events in order
+	// each channel will have been closed even if events are received out of order
+	for i, c := range events {
+		select {
+		case <-v.quit:
+			return errors.New("connection closed")
+		case <-timeoutC:
+			return errors.New("timeout waiting for " + ops[i].String() + " event")
+		case <-c:
+		}
 	}
 	return nil
 }

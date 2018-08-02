@@ -73,10 +73,13 @@ func ipDiscovery(udpConn *net.UDPConn, SSRC uint32) (ip string, port uint16, err
 func (v *VoiceConnection) udpKeepAlive(interval time.Duration) {
 	v.log(LogDebug, "called")
 
-	defer v.waitGroup.Done()
-	defer v.udpConn.Close()
 	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	defer func() {
+		ticker.Stop()
+		v.udpConn.Close()
+		v.waitGroup.Done()
+		// TODO if err isnt because v.quit is closed (and the udpConn was closed, then reconnect)
+	}()
 
 	var err error
 	var sequence uint64
@@ -104,12 +107,12 @@ func (v *VoiceConnection) udpKeepAlive(interval time.Duration) {
 func (v *VoiceConnection) opusSender(src <-chan []byte, rate, size int) {
 	v.log(LogDebug, "called")
 
-	defer v.waitGroup.Done()
-
 	defer func() {
 		v.eventMu.Lock()
 		v.speaking = false
 		v.eventMu.Unlock()
+		v.waitGroup.Done()
+		// TODO detect if reason for return should cause a reconnect?
 	}()
 
 	var sequence uint16

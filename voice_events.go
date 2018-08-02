@@ -37,7 +37,7 @@ type voiceEvent struct {
 // As a client we generally know up front what Operation we are sending, so we use a separate
 // base struct to avoid having to do partial json.Marshals on the nested structs.
 type voiceClientEvent struct {
-	Operation int         `json:"op"`
+	Operation voiceOp     `json:"op"`
 	Data      interface{} `json:"d"`
 }
 
