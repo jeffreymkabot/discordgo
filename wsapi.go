@@ -597,12 +597,12 @@ func (s *Session) ChannelVoiceJoin(gID, cID string, mute, deaf bool) (voice *Voi
 		}
 	}
 
-	// If we are changing voice channel then discord will only emit a VoiceStateUpdate
-	// Won't emit VoiceServerUpdate unless we have never connected or we send a disconnect frame
+	// If we are already in a voice channel then discord will only emit a VoiceStateUpdate
+	// Emits VoiceServerUpdate when we have never connected or we have sent a disconnect frame
 	defer func() {
 		if err != nil {
 			// if there is an error joining the channel send a send disconnect frame to reset things
-			// disconnect also removes the voice connection from the map so next ChannelVoiceJoin
+			// disconnect removes the voice connection from the map so next ChannelVoiceJoin
 			// will expect both a VoiceStateUpdate and VoiceServerUpdate
 			voice.Disconnect()
 		}
@@ -629,7 +629,7 @@ func (s *Session) ChannelVoiceJoin(gID, cID string, mute, deaf bool) (voice *Voi
 		defer rmServerHandler()
 	}
 
-	// get the next VoiceStateUpdate about ourself in this guild
+	// get the next VoiceStateUpdate about our user in this guild
 	stateC = make(chan *VoiceStateUpdate, 1)
 	rmStateHandler := s.AddHandler(func(session *Session, st *VoiceStateUpdate) {
 		if st.ChannelID == "" {
@@ -684,7 +684,6 @@ func (s *Session) ChannelVoiceJoin(gID, cID string, mute, deaf bool) (voice *Voi
 		s.log(LogError, err.Error())
 		return
 	}
-
 	voice.Lock()
 	voice.ChannelID = state.ChannelID
 	voice.sessionID = state.SessionID
@@ -853,7 +852,6 @@ func (s *Session) reconnect() {
 }
 
 // Close closes a websocket and stops all listening/heartbeat goroutines.
-// TODO: Add support for Voice WS/UDP connections
 func (s *Session) Close() (err error) {
 
 	s.log(LogInformational, "called")
@@ -867,8 +865,11 @@ func (s *Session) Close() (err error) {
 		s.listening = nil
 	}
 
-	// TODO: Close all active Voice Connections too
-	// this should force stop any reconnecting voice channels too
+	// Close all active Voice Connections too
+	// This stops any reconnecting voice channels too
+	for _, voice := range s.VoiceConnections {
+		voice.Disconnect()
+	}
 
 	if s.wsConn != nil {
 

@@ -77,17 +77,23 @@ func ipDiscovery(udpConn *net.UDPConn, deadline time.Time, SSRC uint32) (ip stri
 func (v *VoiceConnection) udpKeepAlive(interval time.Duration) {
 	v.log(LogDebug, "called")
 
+	var err error
 	ticker := time.NewTicker(interval)
+
 	defer func() {
 		ticker.Stop()
-		v.udpConn.Close()
+		if err != nil {
+			select {
+			case <-v.quit: // v.Close() was called so error was expected
+			default:
+				v.log(LogError, "error in udpKeepAlive %s", err)
+				go v.reconnect()
+			}
+		}
 		v.waitGroup.Done()
-		// TODO if err isnt because v.quit is closed (and the udpConn was closed, then reconnect)
 	}()
 
-	var err error
 	var sequence uint64
-
 	packet := make([]byte, 8)
 
 	for {
@@ -102,7 +108,7 @@ func (v *VoiceConnection) udpKeepAlive(interval time.Duration) {
 
 		_, err = v.udpConn.Write(packet)
 		if err != nil {
-			v.log(LogError, "error sending udp keepalive packet, %v", err)
+			err = errors.Wrap(err, "failed to send udp keepalive packet")
 			return
 		}
 	}
@@ -111,12 +117,23 @@ func (v *VoiceConnection) udpKeepAlive(interval time.Duration) {
 func (v *VoiceConnection) opusSender(src <-chan []byte, rate, size int) {
 	v.log(LogDebug, "called")
 
+	var err error
+	ticker := time.NewTicker(time.Millisecond * time.Duration(size/(rate/1000)))
+
 	defer func() {
+		ticker.Stop()
 		v.eventMu.Lock()
 		v.speaking = false
 		v.eventMu.Unlock()
+		if err != nil {
+			select {
+			case <-v.quit: // v.Close() was called so error was expected
+			default:
+				v.log(LogError, "error in opusSender %s", err)
+				go v.reconnect()
+			}
+		}
 		v.waitGroup.Done()
-		// TODO detect if reason for return should cause a reconnect?
 	}()
 
 	var sequence uint16
@@ -135,9 +152,6 @@ func (v *VoiceConnection) opusSender(src <-chan []byte, rate, size int) {
 	udpHeader[1] = 0x78
 	binary.BigEndian.PutUint32(udpHeader[8:], SSRC)
 
-	ticker := time.NewTicker(time.Millisecond * time.Duration(size/(rate/1000)))
-	defer ticker.Stop()
-
 	for {
 		select {
 		case <-v.quit:
@@ -153,6 +167,7 @@ func (v *VoiceConnection) opusSender(src <-chan []byte, rate, size int) {
 			v.eventMu.RUnlock()
 
 			if !speaking {
+				// this error should not cause a causing reconnect
 				err := v.Speaking(true)
 				if err != nil {
 					// docs say this will disconnect us with an invalid SSRC error, but we can try
@@ -176,10 +191,9 @@ func (v *VoiceConnection) opusSender(src <-chan []byte, rate, size int) {
 			case <-ticker.C:
 			}
 
-			_, err := v.udpConn.Write(sendbuf)
+			_, err = v.udpConn.Write(sendbuf)
 			if err != nil {
-				v.log(LogError, "udp write error, %s", err)
-				v.log(LogDebug, "voice struct: %#v\n", v)
+				err = errors.Wrapf(err, "udp write error")
 				return
 			}
 
@@ -211,23 +225,32 @@ type Packet struct {
 func (v *VoiceConnection) opusReceiver(dst chan<- *Packet) {
 	v.log(LogDebug, "called")
 
-	defer v.waitGroup.Done()
+	var err error
 
-	recvbuf := make([]byte, 1024)
-	var nonce [24]byte
-
-	for {
-		rlen, err := v.udpConn.Read(recvbuf)
+	defer func() {
 		if err != nil {
 			select {
-			case <-v.quit:
-				// v.Close() was called so error was expected
+			case <-v.quit: // v.Close() was called so error was expected
 				return
 			default:
+				v.log(LogError, "error in opusReceiver %v", err)
+				go v.reconnect()
 			}
-			v.log(LogError, "failed to read from udp connection, %v", err)
+		}
+		v.waitGroup.Done()
+	}()
+
+	var rlen int
+	var nonce [24]byte
+	recvbuf := make([]byte, 1024)
+
+	for {
+		rlen, err = v.udpConn.Read(recvbuf)
+		if err != nil {
+			err = errors.Wrap(err, "failed to read from udp connection")
 			return
 		}
+
 		select {
 		case <-v.quit:
 			return

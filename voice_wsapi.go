@@ -20,10 +20,11 @@ const (
 	udpKeepAliveInterval = 5 * time.Second
 )
 
+// A VoiceConnection struct holds all the data and functions related to a Discord Voice Connection.
 type VoiceConnection struct {
+	// Mutex synchronizes fields set in ChannelVoiceJoin and by events on main gateway
+	// Prevents concurrent calls to v.open() and v.Close()
 	sync.RWMutex
-
-	LogLevel int
 
 	// Fields in next block should all be set set by ChannelVoiceJoin before calling v.open()
 
@@ -37,17 +38,20 @@ type VoiceConnection struct {
 	sessionID string
 	session   *Session
 
-	ShouldReconnectOnError bool
+	Debug    bool // If true, print extra logging -- DEPRECATED, use LogLevel instead
+	LogLevel int
+	Ready    bool // If true, voice is ready to send/receive audio
 
-	OpusSend chan []byte
-	OpusRecv chan *Packet
-
-	Ready bool
+	OpusSend chan []byte  // Chan for sending opus audio
+	OpusRecv chan *Packet // Chan for receiving opus audio
 
 	voiceSpeakingUpdateHandlers []VoiceSpeakingUpdateHandler
 
 	quit      chan struct{}
 	waitGroup sync.WaitGroup
+
+	stopReconnect  chan struct{}
+	allowReconnect chan struct{}
 
 	wsMutex       sync.Mutex
 	wsConn        *websocket.Conn
@@ -67,22 +71,25 @@ type VoiceConnection struct {
 	udpConn *net.UDPConn
 }
 
-// TODO open should error if called on a voiceConnection that is already open
 func (v *VoiceConnection) open() (err error) {
 	v.log(LogDebug, "called")
 
 	v.Lock()
 	defer func() {
 		v.Unlock()
+		// clean up any opened resources
 		if err != nil {
 			v.log(LogError, err.Error())
-			// close any opened connections or goroutines
-			v.Close()
+			v.close()
 		}
 	}()
 
-	v.LogLevel = LogDebug
-	v.quit = make(chan struct{})
+	// TODO
+	alreadyOpen := false
+	if alreadyOpen {
+		err = ErrWSAlreadyOpen
+		return
+	}
 
 	endpoint := strings.TrimSuffix(v.endpoint, ":80")
 	gateway := "wss://" + endpoint + "?v=" + voiceAPIVersion
@@ -93,6 +100,7 @@ func (v *VoiceConnection) open() (err error) {
 		return
 	}
 
+	v.quit = make(chan struct{})
 	v.wsConn = wsConn
 	// new websocket connection, so reset all event channels
 	v.heartbeatAckC = make(chan voiceHeartbeatAck, 1)
@@ -109,7 +117,10 @@ func (v *VoiceConnection) open() (err error) {
 
 	// TODO
 	tryResume := false
-	haveReady := false
+	v.eventMu.RLock()
+	haveReady := v.ready.Modes != nil
+	v.eventMu.RUnlock()
+
 	if tryResume && haveReady {
 		// First two events on gateway after sending Resume should be Op 8 Hello and Op 9 Resumed
 		err = v.resume(deadline)
@@ -190,14 +201,40 @@ func (v *VoiceConnection) open() (err error) {
 		go v.opusReceiver(v.OpusRecv)
 	}
 
+	v.Ready = true
+	v.stopReconnect = make(chan struct{})
+
+	// allowed one reconnect per successful call to v.open()
+	v.allowReconnect = make(chan struct{}, 1)
+	v.allowReconnect <- struct{}{}
+
 	return nil
 }
 
+// Close closes the voice ws and udp connections and stops any attempts to automatically reconnect.
 func (v *VoiceConnection) Close() error {
 	v.log(LogDebug, "called")
 
 	v.Lock()
+	if v.stopReconnect != nil {
+		select {
+		case <-v.stopReconnect:
+		default:
+			close(v.stopReconnect)
+		}
+	}
+	v.Unlock()
+
+	return v.close()
+}
+
+// close closes the voice ws and udp connections and any related goroutines.
+func (v *VoiceConnection) close() error {
+	v.log(LogDebug, "called")
+
+	v.Lock()
 	defer v.Unlock()
+
 	if v.quit == nil {
 		return errors.New("never opened")
 	}
@@ -207,14 +244,16 @@ func (v *VoiceConnection) Close() error {
 	default:
 	}
 
-	// wsConn and udpConn can be nil if v.open defers v.Close
+	// wsConn and udpConn can be nil if v.open errored before opening them
 	if v.wsConn != nil {
 		v.log(LogInformational, "sending close message on gateway")
 		v.wsMutex.Lock()
+		// To cleanly close a connection, a client should send a close
+		// frame and wait for the server to close the connection.
 		v.wsConn.SetWriteDeadline(time.Now().Add(voiceWSWriteWait))
 		v.wsConn.WriteMessage(websocket.CloseMessage, []byte{})
-		v.wsMutex.Unlock()
 		v.wsConn.Close()
+		v.wsMutex.Unlock()
 	}
 
 	if v.udpConn != nil {
@@ -224,23 +263,28 @@ func (v *VoiceConnection) Close() error {
 	// terminate goroutines
 	close(v.quit)
 	// wait for
-	// - wsListener (returns on Read error after closing websocket above)
-	// - heartbeat (returns on <-v.quit, closes ws conn which will cause read error in wsListener)
-	// - udpKeepAlive (returns on <-v.quit, closes UDP conn which will cause read/write errors)
-	// - opusSender (returns on <-v.quit or UDP write error)
-	// - opusReceiver (returns on UDP Read error or <-v.quit)
+	// - wsListener (returns on read error after closing websocket)
+	// - heartbeat (returns on <-v.quit or write error after closing websocket)
+	// - udpKeepAlive (returns on <-v.quit or write error after closing udp)
+	// - opusSender (returns on <-v.quit or write error after closing udp)
+	// - opusReceiver (returns on read error after closing udp or <-v.quit)
 	v.waitGroup.Wait()
 	v.Ready = false
-	// TODO what other data should be reset for v.open() during a reconnect
+	// TODO what other data should be reset for v.open() during a reconnect, wsConn? waitGroup?
 	v.speaking = false
 	return nil
 }
 
+// Disconnect tells discord we have left the voice channel, closes the voice websocket
+// and udp connections, and stops any attempts to automatically r econnect.
 func (v *VoiceConnection) Disconnect() (err error) {
 	v.log(LogDebug, "called")
 
+	// Close all resources and stop all reconnect attempts.
 	v.Close()
 
+	// TODO before or after v.Close() ?
+	// Send a OP4 with a nil channel to disconnect
 	data := voiceChannelJoinOp{4, voiceChannelJoinData{&v.GuildID, nil, true, true}}
 	v.session.wsMutex.Lock()
 	err = v.session.wsConn.WriteJSON(data)
@@ -252,28 +296,40 @@ func (v *VoiceConnection) Disconnect() (err error) {
 	delete(v.session.VoiceConnections, v.GuildID)
 	v.session.Unlock()
 
-	return nil
+	return
 }
 
 func (v *VoiceConnection) reconnect() (err error) {
-	// TODO shouldReconnectOnError
-	v.Close()
-	// tryResume := true
+	// allowed one reconnect per successful call to v.open()
+	select {
+	case <-v.allowReconnect:
+	default:
+		return
+	}
+
+	v.close()
+
+	// first attempt should try to resume
+	tryResume := true
+
 	wait := 1 * time.Second
 	for {
 		select {
-		// TODO separate channel for canceling a reconnects
-		case <-v.quit:
+		case <-v.stopReconnect:
 			err = errors.New("reconnect canceled")
 			return
 		case <-time.After(wait):
 		}
 
+		// TODO
+		_ = tryResume
 		err = v.open()
 		if err == nil {
 			return
 		}
-		// tryResume = false
+
+		tryResume = false
+
 		wait *= 2
 		if wait > 600*time.Second {
 			wait = 600 * time.Second
@@ -284,25 +340,21 @@ func (v *VoiceConnection) reconnect() (err error) {
 func (v *VoiceConnection) wsListener() {
 	v.log(LogDebug, "called")
 
-	defer func() {
-		v.wsConn.Close()
-		v.waitGroup.Done()
-	}()
+	defer v.waitGroup.Done()
 	for {
 		// TODO read deadline for heartbeat acks? (also so this does not block forever)
 		_, msg, err := v.wsConn.ReadMessage()
 		if err != nil {
 			select {
-			// v.Close() was called so error was expected
-			case <-v.quit:
-				return
+			case <-v.quit: // v.Close() was called so error was expected
 			default:
+				if closeErr, ok := err.(*websocket.CloseError); ok {
+					v.log(LogError, "voice gateway closed unexpecedly, %s", closeErr)
+				} else {
+					v.log(LogError, "failed to read message from voice gateway %v", err)
+				}
+				go v.reconnect()
 			}
-			if closeErr, ok := err.(*websocket.CloseError); ok {
-				v.log(LogError, "voice gateway closed unexpecedly, %s", closeErr)
-				return
-			}
-			v.log(LogError, "failed to read message from voice gateway %v", err)
 			return
 		}
 
@@ -405,12 +457,16 @@ func (v *VoiceConnection) heartbeat(interval time.Duration) {
 
 	var err error
 	heartbeat := time.NewTicker(interval)
+
 	defer func() {
 		heartbeat.Stop()
-		v.wsConn.Close()
 		if err != nil {
-			v.log(LogError, "error in wsEmitter %s", err)
-			// TODO if err isnt because v.quit is closed (and the wsConn was closed, then reconnect)
+			select {
+			case <-v.quit: // v.Close() was called so error was expected
+			default:
+				v.log(LogError, "error in wsEmitter %s", err)
+				go v.reconnect()
+			}
 		}
 		v.waitGroup.Done()
 	}()
@@ -458,8 +514,12 @@ func (v *VoiceConnection) heartbeat(interval time.Duration) {
 	}
 }
 
+// Speaking sends a speaking notification to Discord over the voice websocket.
+// This must be sent as true prior to sending audio and should be set to false
+// once finished sending audio.
+//  b  : Send true if speaking, false if not.
 func (v *VoiceConnection) Speaking(b bool) error {
-	v.log(LogDebug, "called")
+	v.log(LogDebug, "called (%t)", b)
 
 	v.eventMu.RLock()
 	SSRC := v.ready.SSRC
@@ -599,4 +659,17 @@ func (v *VoiceConnection) awaitEvent(timeoutC <-chan struct{}, ops ...voiceOp) e
 		}
 	}
 	return nil
+}
+
+// ChangeChannel sends Discord a request to change channels within a Guild
+// !!! NOTE !!! This function may be removed in favour of just using ChannelVoiceJoin
+func (v *VoiceConnection) ChangeChannel(channelID string, mute, deaf bool) (err error) {
+	v.log(LogInformational, "called")
+
+	v.RLock()
+	session, guildID := v.session, v.GuildID
+	v.RUnlock()
+
+	_, err = session.ChannelVoiceJoin(guildID, channelID, mute, deaf)
+	return
 }
