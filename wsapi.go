@@ -867,9 +867,11 @@ func (s *Session) Close() (err error) {
 
 	// Close all active Voice Connections too
 	// This stops any reconnecting voice channels too
+	// NB: voice.Disconnect() takes s.Lock(), so calling it here would deadlock
 	for _, voice := range s.VoiceConnections {
-		voice.Disconnect()
+		voice.Close()
 	}
+	s.VoiceConnections = nil
 
 	if s.wsConn != nil {
 
