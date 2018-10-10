@@ -1,6 +1,7 @@
 package discordgo
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"net"
@@ -26,9 +27,12 @@ func udpOpen(endpoint string, port int) (*net.UDPConn, error) {
 	return udpConn, nil
 }
 
-func ipDiscovery(udpConn *net.UDPConn, deadline time.Time, SSRC uint32) (ip string, port uint16, err error) {
-	udpConn.SetDeadline(deadline)
-	defer udpConn.SetDeadline(time.Time{})
+func ipDiscovery(ctx context.Context, udpConn *net.UDPConn, SSRC uint32) (ip string, port uint16, err error) {
+	deadline, ok := ctx.Deadline()
+	if ok {
+		udpConn.SetDeadline(deadline)
+		defer udpConn.SetDeadline(time.Time{})
+	}
 
 	addr := udpConn.RemoteAddr().String()
 
@@ -71,34 +75,16 @@ func ipDiscovery(udpConn *net.UDPConn, deadline time.Time, SSRC uint32) (ip stri
 	return
 }
 
-// TODO only send "keep-alive" packets when opusSender is idle
-// TODO test to see if this actually contends with opusSender
-// TODO set deadlines for v.udpConn.Writes
-func (v *VoiceConnection) udpKeepAlive(interval time.Duration) {
-	v.log(LogDebug, "called")
-
-	var err error
+func udpKeepAlive(quit chan struct{}, udpConn *net.UDPConn, interval time.Duration) {
 	ticker := time.NewTicker(interval)
-
-	defer func() {
-		ticker.Stop()
-		if err != nil {
-			select {
-			case <-v.quit: // v.Close() was called so error was expected
-			default:
-				v.log(LogError, "error in udpKeepAlive %s", err)
-				go v.reconnect()
-			}
-		}
-		v.waitGroup.Done()
-	}()
+	defer ticker.Stop()
 
 	var sequence uint64
 	packet := make([]byte, 8)
 
 	for {
 		select {
-		case <-v.quit:
+		case <-quit:
 			return
 		case <-ticker.C:
 		}
@@ -106,73 +92,45 @@ func (v *VoiceConnection) udpKeepAlive(interval time.Duration) {
 		binary.LittleEndian.PutUint64(packet, sequence)
 		sequence++
 
-		_, err = v.udpConn.Write(packet)
+		udpConn.SetWriteDeadline(time.Now().Add(udpWriteTimeout))
+		_, err := udpConn.Write(packet)
+		udpConn.SetWriteDeadline(time.Time{})
+
 		if err != nil {
 			err = errors.Wrap(err, "failed to send udp keepalive packet")
+			// TODO signal voice connection error, possibly reconnect
 			return
 		}
 	}
 }
 
-func (v *VoiceConnection) opusSender(src <-chan []byte, rate, size int) {
-	v.log(LogDebug, "called")
-
-	var err error
+func opusSender(quit chan struct{}, udpConn *net.UDPConn, src <-chan []byte, SSRC uint32, secretKey [32]byte, rate, size int) {
 	ticker := time.NewTicker(time.Millisecond * time.Duration(size/(rate/1000)))
-
-	defer func() {
-		ticker.Stop()
-		v.eventMu.Lock()
-		v.speaking = false
-		v.eventMu.Unlock()
-		if err != nil {
-			select {
-			case <-v.quit: // v.Close() was called so error was expected
-			default:
-				v.log(LogError, "error in opusSender %s", err)
-				go v.reconnect()
-			}
-		}
-		v.waitGroup.Done()
-	}()
+	defer ticker.Stop()
 
 	var sequence uint16
 	var timestamp uint32
-	var recvbuf []byte
-	var ok bool
-	udpHeader := make([]byte, 12)
 	var nonce [24]byte
 
-	v.eventMu.RLock()
-	SSRC := v.ready.SSRC
-	v.eventMu.RUnlock()
-
 	// build the parts that don't change in the udpHeader
+	udpHeader := make([]byte, 12)
 	udpHeader[0] = 0x80
 	udpHeader[1] = 0x78
 	binary.BigEndian.PutUint32(udpHeader[8:], SSRC)
 
 	for {
 		select {
-		case <-v.quit:
+		case <-quit:
 			return
-		case recvbuf, ok = <-src:
+		case recvbuf, ok := <-src:
 			if !ok {
 				return
 			}
 
-			v.eventMu.RLock()
-			speaking := v.speaking
-			secretKey := v.sessionDesc.SecretKey
-			v.eventMu.RUnlock()
-
+			// TODO manage speaking state
+			var speaking bool
 			if !speaking {
-				// this error should not cause a causing reconnect
-				err := v.Speaking(true)
-				if err != nil {
-					// docs say this will disconnect us with an invalid SSRC error, but we can try
-					v.log(LogWarning, "error sending speaking payload before sending voice data, %s", err)
-				}
+				// speaking(true)
 			}
 
 			// Add sequence and timestamp to udpPacket
@@ -186,14 +144,18 @@ func (v *VoiceConnection) opusSender(src <-chan []byte, rate, size int) {
 			// block here until we're exactly at the right time :)
 			// Then send rtp audio packet to Discord over UDP
 			select {
-			case <-v.quit:
+			case <-quit:
 				return
 			case <-ticker.C:
 			}
 
-			_, err = v.udpConn.Write(sendbuf)
+			udpConn.SetWriteDeadline(time.Now().Add(udpWriteTimeout))
+			_, err := udpConn.Write(sendbuf)
+			udpConn.SetWriteDeadline(time.Time{})
+
 			if err != nil {
 				err = errors.Wrapf(err, "udp write error")
+				// TODO signal voice connection error, possibly reconnect
 				return
 			}
 
@@ -222,37 +184,20 @@ type Packet struct {
 	PCM       []int16
 }
 
-func (v *VoiceConnection) opusReceiver(dst chan<- *Packet) {
-	v.log(LogDebug, "called")
-
-	var err error
-
-	defer func() {
-		if err != nil {
-			select {
-			case <-v.quit: // v.Close() was called so error was expected
-				return
-			default:
-				v.log(LogError, "error in opusReceiver %v", err)
-				go v.reconnect()
-			}
-		}
-		v.waitGroup.Done()
-	}()
-
-	var rlen int
+func opusReceiver(quit chan struct{}, udpConn *net.UDPConn, dst chan<- *Packet, secretKey [32]byte) {
 	var nonce [24]byte
 	recvbuf := make([]byte, 1024)
 
 	for {
-		rlen, err = v.udpConn.Read(recvbuf)
+		rlen, err := udpConn.Read(recvbuf)
 		if err != nil {
 			err = errors.Wrap(err, "failed to read from udp connection")
+			// TODO signal voice connection error, possibly reconnect
 			return
 		}
 
 		select {
-		case <-v.quit:
+		case <-quit:
 			return
 		default:
 		}
@@ -271,10 +216,6 @@ func (v *VoiceConnection) opusReceiver(dst chan<- *Packet) {
 		// decrypt opus data
 		copy(nonce[:], recvbuf[0:12])
 
-		v.eventMu.RLock()
-		secretKey := v.sessionDesc.SecretKey
-		v.eventMu.RUnlock()
-
 		p.Opus, _ = secretbox.Open(nil, recvbuf[12:rlen], &nonce, &secretKey)
 
 		if len(p.Opus) > 8 && recvbuf[0] == 0x90 {
@@ -283,7 +224,7 @@ func (v *VoiceConnection) opusReceiver(dst chan<- *Packet) {
 		}
 
 		select {
-		case <-v.quit:
+		case <-quit:
 			return
 		case dst <- &p:
 		}

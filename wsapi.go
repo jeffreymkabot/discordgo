@@ -589,11 +589,12 @@ func (s *Session) ChannelVoiceJoin(gID, cID string, mute, deaf bool) (voice *Voi
 	s.RUnlock()
 	if !exists {
 		voice = &VoiceConnection{
-			UserID:  s.State.User.ID,
-			GuildID: gID,
-			mute:    mute,
-			deaf:    deaf,
-			session: s,
+			UserID:   s.State.User.ID,
+			GuildID:  gID,
+			mute:     mute,
+			deaf:     deaf,
+			session:  s,
+			LogLevel: LogDebug,
 		}
 	}
 
