@@ -51,17 +51,22 @@ type VoiceConnection struct {
 	wsMutex sync.Mutex
 	wsConn  *websocket.Conn
 
+	udpConn *net.UDPConn
+
 	voiceSpeakingUpdateHandlers []VoiceSpeakingUpdateHandler
 
 	ssrc uint32
 	// TODO protect with mutex / atomics
 	speaking bool
 
-	quit chan<- struct{}
+	quit     chan struct{}
+	disposed chan struct{}
+	wg       sync.WaitGroup
 }
 
 // context passed to open allows cancellation of handshake
 func (v *VoiceConnection) open(ctx context.Context) error {
+	// cannot be called concurrently with v.Close()
 	v.Lock()
 	defer v.Unlock()
 
@@ -71,11 +76,12 @@ func (v *VoiceConnection) open(ctx context.Context) error {
 	}
 
 	quit := make(chan struct{})
-	v.quit = quit
-	heartbeatInterval := time.Duration(0.75*float64(h.hello.HeartbeatInterval)) * time.Millisecond
+	v.quit = make(chan struct{})
+	v.disposed = make(chan struct{})
 
-	go v.wsListener(quit, h.wsConn)
+	heartbeatInterval := time.Duration(0.75*float64(h.hello.HeartbeatInterval)) * time.Millisecond
 	go v.voiceWsHeartbeat(quit, h.wsConn, heartbeatInterval)
+	go v.wsListener(quit, h.wsConn)
 	go udpKeepAlive(quit, h.udpConn, udpKeepAliveInterval)
 
 	// must reuse OpusSend and OpusRecv if already exists so clients of the library do not need to handle reconnect
@@ -92,13 +98,88 @@ func (v *VoiceConnection) open(ctx context.Context) error {
 	}
 
 	go func() {
-		<-quit
-		// TODO attempt reconnect if allowed
+		<-quit // TODO reconnect signal
+		ctx, cancel := context.Background(), func() {}
+		wait := 1 * time.Second
+		select {
+		case <-v.disposed:
+			cancel()
+		case <-time.After(wait):
+			ctx, cancel = context.WithTimeout(context.Background(), voiceHandshakeTimeout)
+			err := v.open(ctx)
+			cancel()
+			if err == nil {
+				return
+			}
+
+			wait *= 2
+			if wait > 600*time.Second {
+				wait = 600 * time.Second
+			}
+		}
 	}()
 
 	v.wsConn = h.wsConn
+	v.udpConn = h.udpConn
 	v.Ready = true
 	return nil
+}
+
+// Close closes the voice websocket and udp connections
+// and stops any attempts to automatically reconnect the voice connection.
+func (v *VoiceConnection) Close() error {
+	// cannot be called concurrently with v.open() or other calls to v.Close()
+	v.Lock()
+	defer v.Unlock()
+
+	select {
+	case <-v.disposed:
+		return errors.New("already closed")
+	default:
+		close(v.disposed)
+	}
+	// v.quit possibly already closed by automatic reconnect
+	select {
+	case <-v.quit:
+	default:
+		close(v.quit)
+	}
+
+	// wsConn and udpConn are not nil if v was ever successfully opened, but belt and braces
+	if v.wsConn != nil {
+		// TODO "clean" close (e.g. close message)
+		v.wsConn.Close()
+	}
+	if v.udpConn != nil {
+		v.udpConn.Close()
+	}
+	// wait for goroutines to terminate
+	v.wg.Wait()
+	return nil
+}
+
+// Disconnect tells discord we have left the voice channel, closes the voice websocket
+// and udp connections, and stops any attempts to automatically reconnect the voice connection.
+func (v *VoiceConnection) Disconnect() (err error) {
+	v.log(LogDebug, "called")
+
+	// Close all resources and stop all reconnect attempts.
+	v.Close()
+
+	// TODO before or after v.Close() ?
+	// Send a OP4 with a nil channel to disconnect
+	data := voiceChannelJoinOp{4, voiceChannelJoinData{&v.GuildID, nil, true, true}}
+	v.session.wsMutex.Lock()
+	err = v.session.wsConn.WriteJSON(data)
+	v.session.wsMutex.Unlock()
+
+	v.log(LogInformational, "deleting VoiceConnection %s", v.GuildID)
+
+	v.session.Lock()
+	delete(v.session.VoiceConnections, v.GuildID)
+	v.session.Unlock()
+
+	return
 }
 
 type handshake struct {
@@ -210,37 +291,6 @@ func (v *VoiceConnection) handshake(ctx context.Context) (h handshake, err error
 		ready:       ready,
 		sessionDesc: sessionDesc,
 	}
-
-	return
-}
-
-// Close closes the voice ws and udp connections and stops any attempts to automatically reconnect.
-func (v *VoiceConnection) Close() error {
-	v.log(LogDebug, "called")
-	// TODO close and prevent reconnects
-	return nil
-}
-
-// Disconnect tells discord we have left the voice channel, closes the voice websocket
-// and udp connections, and stops any attempts to automatically r econnect.
-func (v *VoiceConnection) Disconnect() (err error) {
-	v.log(LogDebug, "called")
-
-	// Close all resources and stop all reconnect attempts.
-	v.Close()
-
-	// TODO before or after v.Close() ?
-	// Send a OP4 with a nil channel to disconnect
-	data := voiceChannelJoinOp{4, voiceChannelJoinData{&v.GuildID, nil, true, true}}
-	v.session.wsMutex.Lock()
-	err = v.session.wsConn.WriteJSON(data)
-	v.session.wsMutex.Unlock()
-
-	v.log(LogInformational, "deleting VoiceConnection %s", v.GuildID)
-
-	v.session.Lock()
-	delete(v.session.VoiceConnections, v.GuildID)
-	v.session.Unlock()
 
 	return
 }
