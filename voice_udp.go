@@ -75,7 +75,9 @@ func ipDiscovery(ctx context.Context, udpConn *net.UDPConn, SSRC uint32) (ip str
 	return
 }
 
-func udpKeepAlive(quit chan struct{}, udpConn *net.UDPConn, interval time.Duration) {
+func (v *VoiceConnection) udpKeepAlive(quit <-chan struct{}, onError func(error), interval time.Duration) {
+	defer v.wg.Done()
+
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -92,19 +94,21 @@ func udpKeepAlive(quit chan struct{}, udpConn *net.UDPConn, interval time.Durati
 		binary.LittleEndian.PutUint64(packet, sequence)
 		sequence++
 
-		udpConn.SetWriteDeadline(time.Now().Add(udpWriteTimeout))
-		_, err := udpConn.Write(packet)
-		udpConn.SetWriteDeadline(time.Time{})
+		v.udpConn.SetWriteDeadline(time.Now().Add(udpWriteTimeout))
+		_, err := v.udpConn.Write(packet)
+		v.udpConn.SetWriteDeadline(time.Time{})
 
 		if err != nil {
 			err = errors.Wrap(err, "failed to send udp keepalive packet")
-			// TODO signal voice connection error, possibly reconnect
+			onError(err)
 			return
 		}
 	}
 }
 
-func opusSender(quit chan struct{}, udpConn *net.UDPConn, src <-chan []byte, SSRC uint32, secretKey [32]byte, rate, size int) {
+func (v *VoiceConnection) opusSender(quit chan struct{}, onError func(error), src <-chan []byte, SSRC uint32, secretKey [32]byte, rate, size int) {
+	defer v.wg.Done()
+
 	ticker := time.NewTicker(time.Millisecond * time.Duration(size/(rate/1000)))
 	defer ticker.Stop()
 
@@ -127,10 +131,12 @@ func opusSender(quit chan struct{}, udpConn *net.UDPConn, src <-chan []byte, SSR
 				return
 			}
 
-			// TODO manage speaking state
-			var speaking bool
+			v.speakingMutex.RLock()
+			speaking := v.speaking
+			v.speakingMutex.RUnlock()
 			if !speaking {
-				// speaking(true)
+				// try to send voice anyway if error
+				_ = v.Speaking(true)
 			}
 
 			// Add sequence and timestamp to udpPacket
@@ -149,13 +155,13 @@ func opusSender(quit chan struct{}, udpConn *net.UDPConn, src <-chan []byte, SSR
 			case <-ticker.C:
 			}
 
-			udpConn.SetWriteDeadline(time.Now().Add(udpWriteTimeout))
-			_, err := udpConn.Write(sendbuf)
-			udpConn.SetWriteDeadline(time.Time{})
+			v.udpConn.SetWriteDeadline(time.Now().Add(udpWriteTimeout))
+			_, err := v.udpConn.Write(sendbuf)
+			v.udpConn.SetWriteDeadline(time.Time{})
 
 			if err != nil {
 				err = errors.Wrapf(err, "udp write error")
-				// TODO signal voice connection error, possibly reconnect
+				onError(err)
 				return
 			}
 
@@ -184,15 +190,17 @@ type Packet struct {
 	PCM       []int16
 }
 
-func opusReceiver(quit chan struct{}, udpConn *net.UDPConn, dst chan<- *Packet, secretKey [32]byte) {
+func (v *VoiceConnection) opusReceiver(quit <-chan struct{}, onError func(error), dst chan<- *Packet, secretKey [32]byte) {
+	defer v.wg.Done()
+
 	var nonce [24]byte
 	recvbuf := make([]byte, 1024)
 
 	for {
-		rlen, err := udpConn.Read(recvbuf)
+		rlen, err := v.udpConn.Read(recvbuf)
 		if err != nil {
 			err = errors.Wrap(err, "failed to read from udp connection")
-			// TODO signal voice connection error, possibly reconnect
+			onError(err)
 			return
 		}
 

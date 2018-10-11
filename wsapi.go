@@ -13,6 +13,7 @@ package discordgo
 import (
 	"bytes"
 	"compress/zlib"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -594,7 +595,7 @@ func (s *Session) ChannelVoiceJoin(gID, cID string, mute, deaf bool) (voice *Voi
 			mute:     mute,
 			deaf:     deaf,
 			session:  s,
-			LogLevel: LogDebug,
+			LogLevel: s.LogLevel,
 		}
 	}
 
@@ -660,10 +661,7 @@ func (s *Session) ChannelVoiceJoin(gID, cID string, mute, deaf bool) (voice *Voi
 
 	var state *VoiceStateUpdate
 	var server *VoiceServerUpdate
-	timeoutC := make(chan struct{})
-	time.AfterFunc(10*time.Second, func() {
-		close(timeoutC)
-	})
+	timeoutC := time.After(10 * time.Second)
 
 	if needServer {
 		select {
@@ -694,7 +692,9 @@ func (s *Session) ChannelVoiceJoin(gID, cID string, mute, deaf bool) (voice *Voi
 	if exists {
 		voice.Close()
 	}
-	err = voice.open()
+	ctx, cancel := context.WithTimeout(context.Background(), voiceHandshakeTimeout)
+	err = voice.open(ctx)
+	cancel()
 	if err != nil {
 		s.log(LogError, "error opening voice connection, %s", err)
 		return
@@ -735,7 +735,9 @@ func (s *Session) onVoiceServerUpdate(st *VoiceServerUpdate) {
 	voice.Unlock()
 
 	// Open a connection to the voice server
-	err := voice.open()
+	ctx, cancel := context.WithTimeout(context.Background(), voiceHandshakeTimeout)
+	err := voice.open(ctx)
+	cancel()
 	if err != nil {
 		s.log(LogError, "onVoiceServerUpdate voice.open, %s", err)
 	}
@@ -824,7 +826,8 @@ func (s *Session) reconnect() {
 				for _, v := range s.VoiceConnections {
 
 					s.log(LogInformational, "reconnecting voice connection to guild %s", v.GuildID)
-					go v.reconnect()
+					// TODO re-evaluate if this is needed
+					// go v.reconnect()
 
 					// This is here just to prevent violently spamming the
 					// voice reconnects
